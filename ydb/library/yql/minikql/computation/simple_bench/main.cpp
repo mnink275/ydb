@@ -1,12 +1,12 @@
 #include "../mkql_key_payload_value_lru_cache.h"
 
 #include <ydb/library/yql/minikql/mkql_type_builder.h>
+#include <ydb/library/yql/minikql/mkql_string_util.h>
 #include <util/generic/xrange.h>
 
 #include <ydb/core/ymq/actor/sha256.h>
 
-#include "../concurrent-lru-cache.h"
-#include "ydb/library/yql/minikql/mkql_string_util.h"
+#include "concurrent_lru_wrapper.hpp"
 
 #include <optional>
 #include <fstream>
@@ -73,19 +73,16 @@ class Statistic {
 };
 
 template <NUdf::EDataSlot DataSlot>
-class KeysGenerator final {
+class IKeysGenerator {
 public:
-    KeysGenerator(
-        NMiniKQL::TScopedAlloc& alloc,
-        double mean = 0.0,
-        double stddev = 10.0,
-        size_t seed = std::random_device{}())
-        : Generator(seed),
-          Distribution(mean, stddev),
-          Alloc(alloc) {};
+    virtual ~IKeysGenerator() = default;
+    virtual NYql::NUdf::TUnboxedValuePod NextKey() = 0;
+    size_t UniqueCount() const {
+        return Freqs.size();
+    }
 
-    NYql::NUdf::TUnboxedValuePod NextKey() {
-        auto genKey = std::round(Distribution(Generator));
+protected:
+    NYql::NUdf::TUnboxedValuePod NextKeyImpl(const auto& genKey) {
         if constexpr (DataSlot == NUdf::EDataSlot::String) {
             auto strKey = NKikimr::NSQS::CalcSHA256(std::to_string(genKey));
             return NMiniKQL::MakeString(strKey);
@@ -98,15 +95,31 @@ public:
         }
     }
 
-    size_t UniqueCount() {
-        return Freqs.size();
+private:
+    std::map<i64, size_t> Freqs;
+};
+
+template <NUdf::EDataSlot DataSlot>
+class NormalDistributionKeyGenerator final : public IKeysGenerator<DataSlot> {
+public:
+    NormalDistributionKeyGenerator(
+        NMiniKQL::TScopedAlloc& alloc,
+        double mean = 0.0,
+        double stddev = 10.0,
+        size_t seed = std::random_device{}())
+        : Generator(seed),
+          Distribution(mean, stddev),
+          Alloc(alloc) {};
+
+    NYql::NUdf::TUnboxedValuePod NextKey() override {
+        auto genKey = std::round(Distribution(Generator));
+        return this->NextKeyImpl(genKey);
     }
 
 private:
     std::mt19937 Generator;
     std::normal_distribution<double> Distribution;
     NMiniKQL::TScopedAlloc& Alloc;
-    std::map<i64, i64> Freqs;
 };
 
 class HashEqualUnboxedValue {
@@ -124,30 +137,6 @@ public:
 
 private:
     const NKikimr::NMiniKQL::TKeyTypeContanerHelper<true, true, false> KeyTypeHelper;
-};
-
-template <class HashEqual>
-class ConcurrentCacheWrapper {
-public:
-    using TCache = HPHP::ConcurrentLRUCache<NUdf::TUnboxedValue, NUdf::TUnboxedValue, HashEqualUnboxedValue>;
-
-    ConcurrentCacheWrapper(size_t maxSize, HashEqual hash_equal)
-        : Cache(maxSize, hash_equal) {}
-
-    void Update(NUdf::TUnboxedValue&& key, NUdf::TUnboxedValue&& value, std::chrono::time_point<std::chrono::steady_clock>&& /*expiration*/) {
-        Cache.insert(std::move(key), std::move(value));
-    }
-
-    std::optional<NUdf::TUnboxedValue> Get(const NUdf::TUnboxedValue key, const std::chrono::time_point<std::chrono::steady_clock>& /*now*/) {
-        TCache::ConstAccessor acs;
-        if (Cache.find(acs, key)) {
-            return *acs;
-        }
-        return std::nullopt;
-    }
-
-private:
-    TCache Cache;
 };
 
 template <NUdf::EDataSlot DataSlot, class TCache>
@@ -178,7 +167,7 @@ private:
     NMiniKQL::TTypeBuilder TypeBuilder;
     TCache Cache;
 
-    KeysGenerator<DataSlot> KeysGenerator;
+    NormalDistributionKeyGenerator<DataSlot> KeysGenerator;
 };
 
 struct BenchContext {
@@ -230,12 +219,12 @@ int main() {
         .Mean = 0.0,
         .Stddev = 1e4
     };
-    KeysGenerator<NUdf::EDataSlot::Int64> i64Generator{main_alloc, benchCtx.Mean, benchCtx.Stddev};
-    KeysGenerator<NUdf::EDataSlot::String> stringGenerator{main_alloc, benchCtx.Mean, benchCtx.Stddev};
+    NormalDistributionKeyGenerator<NUdf::EDataSlot::Int64> i64Generator{main_alloc, benchCtx.Mean, benchCtx.Stddev};
+    NormalDistributionKeyGenerator<NUdf::EDataSlot::String> stringGenerator{main_alloc, benchCtx.Mean, benchCtx.Stddev};
 
     std::cout << "Cache size: " << benchCtx.CacheSize << '\n';
     std::cout << "Mean of normal distribution: " << benchCtx.Mean << '\n';
-    std::cout << "Standart deviation of normal distribution: " << benchCtx.Stddev << '\n';
+    std::cout << "Standard deviation of normal distribution: " << benchCtx.Stddev << '\n';
 
     // i64 as a key, i64 as a value
     NMiniKQL::TKeyPayloadPairVector intCacheInitData;
