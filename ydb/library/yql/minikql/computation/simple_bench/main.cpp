@@ -8,7 +8,6 @@
 
 #include "concurrent_lru_wrapper.hpp"
 
-#include <optional>
 #include <fstream>
 #include <chrono>
 
@@ -72,7 +71,7 @@ class Statistic {
   std::map<T, size_t> Hist;
 };
 
-template <NUdf::EDataSlot DataSlot>
+template <NUdf::EDataSlot DataSlot, bool collectStats = false>
 class IKeysGenerator {
 public:
     virtual ~IKeysGenerator() = default;
@@ -88,7 +87,7 @@ protected:
             return NMiniKQL::MakeString(strKey);
         } else if constexpr (DataSlot == NUdf::EDataSlot::Int64) {
             auto intKey = static_cast<i64>(genKey);
-            ++Freqs[intKey];
+            if constexpr (collectStats) ++Freqs[intKey];
             return NYql::NUdf::TUnboxedValuePod{intKey};
         } else {
             throw std::runtime_error(TString{"Unsupported data slot"} + std::to_string(static_cast<int>(DataSlot)));
@@ -157,6 +156,7 @@ public:
 
     void Get() {
         const auto now = std::chrono::steady_clock::now();
+        // Cache.Prune(now); // does nothing because Entris are always not outdated
         auto res = Cache.Get(KeysGenerator.NextKey(), now);
         Y_DO_NOT_OPTIMIZE_AWAY(res);
     }
@@ -181,17 +181,23 @@ void RunGetBenchmark(TString name, auto& keys, BenchContext benchCtx, size_t see
     using namespace std::chrono_literals;
     std::cout << name << std::endl;
 
+    const auto benchmarkTime = 5s;
+
     CacheFixture<EDataSlot, TCache> concurrentCacheFixture{benchCtx.CacheSize, keys, seed, benchCtx.Mean, benchCtx.Stddev};
     auto start = std::chrono::high_resolution_clock::now();
     size_t count = 0;
-    while (std::chrono::high_resolution_clock::now() - start < 5s) {
+    while (std::chrono::high_resolution_clock::now() - start < benchmarkTime) {
         concurrentCacheFixture.Get();
         ++count;
     }
 
     std::cout << "Get() count: " <<  count << std::endl;
-    std::cout << "Get() average time: " << i64(1'000'000'000) * 5 / count  << " ns" << std::endl;
+    std::cout << "Get() average time: "
+              << std::chrono::duration_cast<std::chrono::nanoseconds>(benchmarkTime).count() / count 
+              << " ns" << std::endl;
     std::cout << std::endl;
+
+    // std::this_thread::sleep_for(5s);
 }
 
 template <class Clock>
@@ -213,12 +219,13 @@ int main() {
     using TYdbCache = NMiniKQL::TUnboxedKeyValueLruCacheWithTtl;
     using TConcurrentCache = ConcurrentCacheWrapper<HashEqualUnboxedValue>;
 
-    constexpr size_t INITIAL_KEYS_COUNT = 1e5;
     BenchContext benchCtx{
-        .CacheSize = static_cast<size_t>(1e4),
+        .CacheSize = static_cast<size_t>(1e6),
         .Mean = 0.0,
-        .Stddev = 1e4
+        .Stddev = 1e6
     };
+    const auto INITIAL_KEYS_COUNT = benchCtx.CacheSize * 10;
+
     NormalDistributionKeyGenerator<NUdf::EDataSlot::Int64> i64Generator{main_alloc, benchCtx.Mean, benchCtx.Stddev};
     NormalDistributionKeyGenerator<NUdf::EDataSlot::String> stringGenerator{main_alloc, benchCtx.Mean, benchCtx.Stddev};
 
@@ -237,8 +244,7 @@ int main() {
 
     const auto uniqueKeysCount = intStat.UniqueCount();
     std::cout << "Unique data count: " << uniqueKeysCount << '\n';
-    std::cout << "Unique i64 count: " << i64Generator.UniqueCount() << '\n';
-    std::cout << "Initial cache fullness: " << 100 * uniqueKeysCount / std::min(uniqueKeysCount, benchCtx.CacheSize) << " %" << '\n';
+    std::cout << "Initial cache fullness: " << 100 * std::min(uniqueKeysCount, benchCtx.CacheSize) / benchCtx.CacheSize << " %" << '\n';
 
     std::cout << '\n';
 
