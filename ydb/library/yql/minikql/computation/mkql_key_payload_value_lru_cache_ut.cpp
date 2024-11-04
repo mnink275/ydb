@@ -71,8 +71,36 @@ Y_UNIT_TEST_SUITE(TUnboxedKeyValueLruCacheWithTtlTest) {
         UNIT_ASSERT_VALUES_EQUAL(0, cache.Size());
     }
 
+
     Y_UNIT_TEST(LruEviction) {
-        //TBD
+        TScopedAlloc alloc(__LOCATION__);
+        TTypeEnvironment typeEnv(alloc);
+        TTypeBuilder typeBuilder(typeEnv);
+        TUnboxedKeyValueLruCacheWithTtl cache(10, typeBuilder.NewDataType(NUdf::EDataSlot::Int32));
+
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto dt = std::chrono::seconds(1);
+
+        UNIT_ASSERT_VALUES_EQUAL(0, cache.Size());
+        // Insert data
+        for (size_t i = 1; i <= 10; ++i){
+            cache.Update(NUdf::TUnboxedValuePod{i}, NUdf::TUnboxedValuePod{}, t0 + dt);
+        }
+
+        UNIT_ASSERT_VALUES_EQUAL(10, cache.Size());
+
+        { // The first element should be evicted
+            cache.Update(NUdf::TUnboxedValuePod{11}, NUdf::TUnboxedValuePod{}, t0 + dt);
+            UNIT_ASSERT(!cache.Get(NUdf::TUnboxedValuePod{1}, t0 + 0 * dt));
+            UNIT_ASSERT_VALUES_EQUAL(10, cache.Size());
+        }
+
+        { // The second element should be touched and the third should be evicted
+            UNIT_ASSERT(cache.Get(NUdf::TUnboxedValuePod{2}, t0 + 0 * dt));
+            cache.Update(NUdf::TUnboxedValuePod{12}, NUdf::TUnboxedValuePod{}, t0 + dt);
+            UNIT_ASSERT(!cache.Get(NUdf::TUnboxedValuePod{3}, t0 + 0 * dt));
+            UNIT_ASSERT_VALUES_EQUAL(10, cache.Size());
+        }
     }
 
     Y_UNIT_TEST(GarbageCollection) {
