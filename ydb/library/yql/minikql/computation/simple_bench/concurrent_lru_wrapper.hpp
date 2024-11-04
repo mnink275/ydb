@@ -17,17 +17,22 @@ public:
     ConcurrentCacheWrapper(size_t maxSize, HashEqual hash_equal)
         : Cache(maxSize, hash_equal) {}
 
-    void Update(NKikimr::NUdf::TUnboxedValue&& key, NKikimr::NUdf::TUnboxedValue&& value, std::chrono::time_point<std::chrono::steady_clock>&& /*expiration*/) {
-        Cache.insert(std::move(key), std::move(value));
+    void Update(NKikimr::NUdf::TUnboxedValue&& key, NKikimr::NUdf::TUnboxedValue&& value, std::chrono::time_point<std::chrono::steady_clock>&& expiration) {
+        //Cache.insert(std::move(key), std::move(value));
+        Cache.update(std::move(key), std::move(value), std::move(expiration));
     }
 
     void Prune(const std::chrono::time_point<std::chrono::steady_clock>& /*now*/) {
         // There is no need to prune the cache because the entries are never outdated
     }
 
-    std::optional<NKikimr::NUdf::TUnboxedValue> Get(const NKikimr::NUdf::TUnboxedValue key, const std::chrono::time_point<std::chrono::steady_clock>& /*now*/) {
+    size_t Size() const {
+        return Cache.size();
+    }
+
+    std::optional<NKikimr::NUdf::TUnboxedValue> Get(const NKikimr::NUdf::TUnboxedValue key, const std::chrono::time_point<std::chrono::steady_clock>& now) {
         typename TCache::ConstAccessor acs;
-        if (Cache.find(acs, key)) {
+        if (Cache.find(acs, key, now)) {
             return *acs;
         }
         return std::nullopt;

@@ -88,11 +88,12 @@ private:
       : m_listNode(nullptr)
     {}
 
-    HashMapValue(const TValue& value, ListNode* node)
-      : m_value(value), m_listNode(node)
+    HashMapValue(const TValue& value, const std::chrono::time_point<std::chrono::steady_clock>& expiration, ListNode* node)
+      : m_value(value), m_expiration(expiration), m_listNode(node)
     {}
 
     TValue m_value;
+    std::chrono::time_point<std::chrono::steady_clock> m_expiration;
     ListNode* m_listNode;
   };
 
@@ -151,7 +152,7 @@ public:
    * otherwise. Updates the eviction list, making the element the
    * most-recently used.
    */
-  bool find(ConstAccessor& ac, const TKey& key);
+  bool find(ConstAccessor& ac, const TKey& key, const std::chrono::time_point<std::chrono::steady_clock>& expiration);
 
   /**
    * Insert a value into the container. Both the key and value will be copied.
@@ -162,7 +163,9 @@ public:
    * will not be updated, and false will be returned. Otherwise, true will be
    * returned.
    */
-  bool insert(const TKey& key, const TValue& value);
+  bool insert(const TKey& key, const TValue& value, const std::chrono::time_point<std::chrono::steady_clock>& expiration);
+
+  bool update(TKey&& key, TValue&& value, std::chrono::time_point<std::chrono::steady_clock>&& expiration);
 
   /**
    * Clear the container. NOT THREAD SAFE -- do not use while other threads
@@ -261,9 +264,27 @@ ConcurrentLRUCache(size_t maxSize, THash hash_equal)
 
 template <class TKey, class TValue, class THash>
 bool ConcurrentLRUCache<TKey, TValue, THash>::
-find(ConstAccessor& ac, const TKey& key) {
+find(ConstAccessor& ac, const TKey& key, const std::chrono::time_point<std::chrono::steady_clock>& expiration) {
   HashMapConstAccessor& hashAccessor = ac.m_hashAccessor;
   if (!m_map.find(hashAccessor, key)) {
+    return false;
+  }
+
+  // Erase element if it is expired
+  if (expiration >= hashAccessor->second.m_expiration) {
+    std::unique_lock<ListMutex> lock(m_listMutex);
+
+    ListNode* node = hashAccessor->second.m_listNode;
+
+    if (node->isInList()) {
+      delink(node);
+      delete node;
+    } else {
+      return false;
+    }
+
+    m_map.erase(hashAccessor);
+    m_size--;
     return false;
   }
 
@@ -285,13 +306,77 @@ find(ConstAccessor& ac, const TKey& key) {
 
 template <class TKey, class TValue, class THash>
 bool ConcurrentLRUCache<TKey, TValue, THash>::
-insert(const TKey& key, const TValue& value) {
+insert(const TKey& key, const TValue& value, const std::chrono::time_point<std::chrono::steady_clock>& /*expiration*/) {
+  throw std::runtime_error("Call update() instead of insert()");
   // Insert into the CHM
   ListNode* node = new ListNode(key);
   HashMapAccessor hashAccessor;
   HashMapValuePair hashMapValue(key, HashMapValue(value, node));
   if (!m_map.insert(hashAccessor, hashMapValue)) {
     delete node;
+    return false;
+  }
+
+  // Evict if necessary, now that we know the hashmap insertion was successful.
+  size_t size = m_size.load();
+  bool evictionDone = false;
+  if (size >= m_maxSize) {
+    // The container is at (or over) capacity, so eviction needs to be done.
+    // Do not decrement m_size, since that would cause other threads to
+    // inappropriately omit eviction during their own inserts.
+    evict();
+    evictionDone = true;
+  }
+
+  // Note that we have to update the LRU list before we increment m_size, so
+  // that other threads don't attempt to evict list items before they even
+  // exist.
+  std::unique_lock<ListMutex> lock(m_listMutex);
+  pushFront(node);
+  lock.unlock();
+  if (!evictionDone) {
+    size = m_size++;
+  }
+  if (size > m_maxSize) {
+    // It is possible for the size to temporarily exceed the maximum if there is
+    // a heavy insert() load, once only as the cache fills. In this situation,
+    // we have to be careful not to have every thread simultaneously attempt to
+    // evict the extra entries, since we could end up underfilled. Instead we do
+    // a compare-and-exchange to acquire an exclusive right to reduce the size
+    // to a particular value.
+    //
+    // We could continue to evict in a loop, but if there are a lot of threads
+    // here at the same time, that could lead to spinning. So we will just evict
+    // one extra element per insert() until the overfill is rectified.
+    if (m_size.compare_exchange_strong(size, size - 1)) {
+      evict();
+    }
+  }
+  return true;
+}
+
+template <class TKey, class TValue, class THash>
+bool ConcurrentLRUCache<TKey, TValue, THash>::
+update(TKey&& key, TValue&& value, std::chrono::time_point<std::chrono::steady_clock>&& expiration) {
+ // Insert into the CHM
+  ListNode* node = new ListNode(key);
+  HashMapAccessor hashAccessor;
+  HashMapValuePair hashMapValue(key, HashMapValue(value, expiration, node));
+  if (!m_map.insert(hashAccessor, hashMapValue)) {
+    delete node;
+    {
+      std::unique_lock<ListMutex> lock(m_listMutex);
+      hashAccessor->second.m_value = std::move(value);
+      hashAccessor->second.m_expiration = std::move(expiration);
+      ListNode* node = hashAccessor->second.m_listNode;
+      // The list node may be out of the list if it is in the process of being
+      // inserted or evicted. Doing this check allows us to lock the list for
+      // shorter periods of time.
+      if (node->isInList()) {
+        delink(node);
+        pushFront(node);
+      }
+    }
     return false;
   }
 
