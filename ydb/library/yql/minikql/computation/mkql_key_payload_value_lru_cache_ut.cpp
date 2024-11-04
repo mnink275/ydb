@@ -38,14 +38,28 @@ Y_UNIT_TEST_SUITE(TUnboxedKeyValueLruCacheWithTtlTest) {
             }
             UNIT_ASSERT_VALUES_EQUAL(3, cache.Size());
         }
+
+        { // Update value
+            auto v = cache.Get(NUdf::TUnboxedValuePod{10}, t0 + dt);
+            UNIT_ASSERT(v);
+            UNIT_ASSERT_VALUES_EQUAL(100, v->Get<i32>());
+            UNIT_ASSERT_VALUES_EQUAL(3, cache.Size());
+
+            cache.Update(NUdf::TUnboxedValuePod{10}, NUdf::TUnboxedValuePod{1000}, t0 + 15 * dt);
+
+            v = cache.Get(NUdf::TUnboxedValuePod{10}, t0 + 14 * dt);
+            UNIT_ASSERT(v);
+            UNIT_ASSERT_VALUES_EQUAL(1000, v->Get<i32>());
+            UNIT_ASSERT_VALUES_EQUAL(3, cache.Size());
+        }
         
         { // Get outdated
-            auto v = cache.Get(NUdf::TUnboxedValuePod{10}, t0 + 10 * dt );
+            auto v = cache.Get(NUdf::TUnboxedValuePod{10}, t0 + 15 * dt );
             UNIT_ASSERT(!v);
             UNIT_ASSERT_VALUES_EQUAL(2, cache.Size());
         }
         { //still exists
-            auto v = cache.Get(NUdf::TUnboxedValuePod{20}, t0 + 10 * dt);
+            auto v = cache.Get(NUdf::TUnboxedValuePod{20}, t0 + 15 * dt);
             UNIT_ASSERT(v);
             UNIT_ASSERT_VALUES_EQUAL(200, v->Get<i32>());
         }
