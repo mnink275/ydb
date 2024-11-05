@@ -7,6 +7,7 @@
 #include <ydb/core/ymq/actor/sha256.h>
 
 #include "concurrent_lru_wrapper.hpp"
+#include "sharded_ydb_lru_cache.hpp"
 
 #include <fstream>
 #include <chrono>
@@ -48,6 +49,9 @@ class Statistic {
     out << "]\n";
     out << "xs = [i for i in range(len(ys))]\n";
     out << "plt.plot(xs, ys)\n";
+    out << "plt.grid(True)\n";
+    out << "plt.xlabel('Elements')\n";
+    out << "plt.ylabel('Count')\n";
     out << "plt.show()\n";
   }
 
@@ -183,11 +187,11 @@ void RunGetBenchmark(TString name, auto& keys, BenchContext benchCtx, size_t see
 
     const auto benchmarkTime = 5s;
 
-    CacheFixture<EDataSlot, TCache> concurrentCacheFixture{benchCtx.CacheSize, keys, seed, benchCtx.Mean, benchCtx.Stddev};
+    CacheFixture<EDataSlot, TCache> cacheFixture{benchCtx.CacheSize, keys, seed, benchCtx.Mean, benchCtx.Stddev};
     auto start = std::chrono::high_resolution_clock::now();
-    size_t count = 0;
+    ui64 count = 0;
     while (std::chrono::high_resolution_clock::now() - start < benchmarkTime) {
-        concurrentCacheFixture.Get();
+        cacheFixture.Get();
         ++count;
     }
 
@@ -197,22 +201,51 @@ void RunGetBenchmark(TString name, auto& keys, BenchContext benchCtx, size_t see
               << " ns" << std::endl;
     std::cout << std::endl;
 
-    // std::this_thread::sleep_for(5s);
+    //std::this_thread::sleep_for(5s);
 }
 
-template <class Clock>
-void DisplayPrecision() {
-    // https://stackoverflow.com/questions/8386128/how-to-get-the-precision-of-high-resolution-clock
-    std::chrono::duration<double, std::nano> ns = typename Clock::duration(1);
-    std::cout << ns.count() << " ns\n";
+
+template <NUdf::EDataSlot EDataSlot, class TCache, size_t ThreadCount>
+void RunGetBenchmarkMultirhead(TString name, auto& keys, BenchContext benchCtx, size_t seed = std::random_device{}()) {
+    using namespace std::chrono_literals;
+    std::cout << name << std::endl;
+
+    const auto benchmarkTime = 5s;
+
+    CacheFixture<EDataSlot, TCache> cacheFixture{benchCtx.CacheSize, keys, seed, benchCtx.Mean, benchCtx.Stddev};
+    
+    std::vector<std::thread> threads;
+    std::vector<ui64> counts(ThreadCount, 0);
+    for (size_t i = 0; i < ThreadCount; ++i) {
+        threads.emplace_back([&cacheFixture, &counts, i, benchmarkTime] {
+            NMiniKQL::TScopedAlloc thread_local_alloc{__LOCATION__};
+
+            auto start = std::chrono::high_resolution_clock::now();
+            while (std::chrono::high_resolution_clock::now() - start < benchmarkTime) {
+                cacheFixture.Get();
+                ++counts[i];
+            }
+        });
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    ui64 sumCount = std::accumulate(counts.begin(), counts.end(), 0ull);
+    std::cout << "Get() count: " << sumCount << std::endl;
+    std::cout << "Get() average time: "
+              << std::chrono::duration_cast<std::chrono::nanoseconds>(benchmarkTime).count() / sumCount 
+              << " ns" << std::endl;
+    std::cout << std::endl;
+
+    //std::this_thread::sleep_for(5s);
 }
 
 }
 
-int main() {
-    DisplayPrecision<std::chrono::high_resolution_clock>();
-    DisplayPrecision<std::chrono::steady_clock>();
-    DisplayPrecision<std::chrono::system_clock>();
+void RunOneThreadBenchmarks() {
+    using namespace std::chrono_literals;
 
     NMiniKQL::TScopedAlloc main_alloc{__LOCATION__};
 
@@ -222,9 +255,9 @@ int main() {
     BenchContext benchCtx{
         .CacheSize = static_cast<size_t>(1e6),
         .Mean = 0.0,
-        .Stddev = 1e6
+        .Stddev = 0.5*1e6
     };
-    const auto INITIAL_KEYS_COUNT = benchCtx.CacheSize * 10;
+    const auto INITIAL_KEYS_COUNT = benchCtx.CacheSize * 2;
 
     NormalDistributionKeyGenerator<NUdf::EDataSlot::Int64> i64Generator{main_alloc, benchCtx.Mean, benchCtx.Stddev};
     NormalDistributionKeyGenerator<NUdf::EDataSlot::String> stringGenerator{main_alloc, benchCtx.Mean, benchCtx.Stddev};
@@ -233,36 +266,110 @@ int main() {
     std::cout << "Mean of normal distribution: " << benchCtx.Mean << '\n';
     std::cout << "Standard deviation of normal distribution: " << benchCtx.Stddev << '\n';
 
-    // i64 as a key, i64 as a value
-    NMiniKQL::TKeyPayloadPairVector intCacheInitData;
-    for (size_t i = 0; i < INITIAL_KEYS_COUNT; ++i) {
-        intCacheInitData.emplace_back(i64Generator.NextKey(), i64Generator.NextKey());
+    {
+        // i64 as a key, i64 as a value
+        NMiniKQL::TKeyPayloadPairVector intCacheInitData;
+        for (size_t i = 0; i < INITIAL_KEYS_COUNT; ++i) {
+            intCacheInitData.emplace_back(i64Generator.NextKey(), i64Generator.NextKey());
+        }
+        Statistic<i64> intStat;
+        intStat.Load(intCacheInitData);
+        intStat.GetHist("int_hist.py");
+
+        // std::cout << "Check intCacheInitData RRS\n";
+        // std::this_thread::sleep_for(5s);
+
+        const auto uniqueKeysCount = intStat.UniqueCount();
+        std::cout << "Unique data count: " << uniqueKeysCount << '\n';
+        std::cout << "Initial cache fullness: " << 100 * std::min(uniqueKeysCount, benchCtx.CacheSize) / benchCtx.CacheSize << " %" << '\n';
+
+        std::cout << '\n';
+
+        const size_t intSeed = std::random_device{}(); // seed for both benchmarks must be the same
+        RunGetBenchmark<NUdf::EDataSlot::Int64, TYdbCache>("TYdbCache: i64", intCacheInitData, benchCtx, intSeed);
+        RunGetBenchmark<NUdf::EDataSlot::Int64, TConcurrentCache>("TConcurrentCache: i64", intCacheInitData, benchCtx, intSeed);
     }
-    Statistic<i64> intStat;
-    intStat.Load(intCacheInitData);
-    intStat.GetHist("int_hist.py");
 
-    const auto uniqueKeysCount = intStat.UniqueCount();
-    std::cout << "Unique data count: " << uniqueKeysCount << '\n';
-    std::cout << "Initial cache fullness: " << 100 * std::min(uniqueKeysCount, benchCtx.CacheSize) / benchCtx.CacheSize << " %" << '\n';
+    {
+        // TStringValue as a key, i64 as a value
+        NMiniKQL::TKeyPayloadPairVector stringValueCacheInitData;
+        for (size_t i = 0; i < INITIAL_KEYS_COUNT; ++i) {
+            stringValueCacheInitData.emplace_back(stringGenerator.NextKey(), i64Generator.NextKey());
+        }
 
-    std::cout << '\n';
+        // std::cout << "Check stringValueInitData RRS\n";
+        // std::this_thread::sleep_for(5s);
 
-    const size_t intSeed = std::random_device{}(); // seed for both benchmarks must be the same
-    RunGetBenchmark<NUdf::EDataSlot::Int64, TYdbCache>("TYdbCache: i64", intCacheInitData, benchCtx, intSeed);
-    RunGetBenchmark<NUdf::EDataSlot::Int64, TConcurrentCache>("TConcurrentCache: i64", intCacheInitData, benchCtx, intSeed);
-
-    // TStringValue as a key, i64 as a value
-    NMiniKQL::TKeyPayloadPairVector stringValueCacheInitData;
-    for (size_t i = 0; i < INITIAL_KEYS_COUNT; ++i) {
-        stringValueCacheInitData.emplace_back(stringGenerator.NextKey(), i64Generator.NextKey());
+        const size_t stringValueSeed = std::random_device{}(); // seed for both benchmarks must be the same
+        RunGetBenchmark<NUdf::EDataSlot::String, TYdbCache>("TYdbCache: TStringValue", stringValueCacheInitData, benchCtx, stringValueSeed);
+        RunGetBenchmark<NUdf::EDataSlot::String, TConcurrentCache>("TConcurrentCache: TStringValue", stringValueCacheInitData, benchCtx, stringValueSeed);
     }
-    // Statistic<NYql::NUdf::TStringValue> stringStat;
-    // stringStat.Load(stringValueCacheInitData);
-    // std::cout << "Unique data count: " << stringStat.UniqueCount() << '\n';
-    // stringStat.GetHist("string_hist.py");
+}
 
-    const size_t stringValueSeed = std::random_device{}(); // seed for both benchmarks must be the same
-    RunGetBenchmark<NUdf::EDataSlot::String, TYdbCache>("TYdbCache: TStringValue", stringValueCacheInitData, benchCtx, stringValueSeed);
-    RunGetBenchmark<NUdf::EDataSlot::String, TConcurrentCache>("TConcurrentCache: TStringValue", stringValueCacheInitData, benchCtx, stringValueSeed);
+void RunMultipleThreadBenchmarks() {
+    using namespace std::chrono_literals;
+
+    NMiniKQL::TScopedAlloc main_alloc{__LOCATION__};
+
+    using TYdbCacheSharded = NMiniKQL::TUnboxedValueLruCacheWithTTLSharded<256>;
+    using TConcurrentCache = ConcurrentCacheWrapper<HashEqualUnboxedValue>;
+
+    BenchContext benchCtx{
+        .CacheSize = static_cast<size_t>(1e6),
+        .Mean = 0.0,
+        .Stddev = 1e6
+    };
+    const auto INITIAL_KEYS_COUNT = benchCtx.CacheSize * 2;
+    const auto THREAD_COUNT = 4;
+
+    NormalDistributionKeyGenerator<NUdf::EDataSlot::Int64> i64Generator{main_alloc, benchCtx.Mean, benchCtx.Stddev};
+    NormalDistributionKeyGenerator<NUdf::EDataSlot::String> stringGenerator{main_alloc, benchCtx.Mean, benchCtx.Stddev};
+
+    std::cout << "Cache size: " << benchCtx.CacheSize << '\n';
+    std::cout << "Mean of normal distribution: " << benchCtx.Mean << '\n';
+    std::cout << "Standard deviation of normal distribution: " << benchCtx.Stddev << '\n';
+
+    {
+        // i64 as a key, i64 as a value
+        NMiniKQL::TKeyPayloadPairVector intCacheInitData;
+        for (size_t i = 0; i < INITIAL_KEYS_COUNT; ++i) {
+            intCacheInitData.emplace_back(i64Generator.NextKey(), i64Generator.NextKey());
+        }
+        Statistic<i64> intStat;
+        intStat.Load(intCacheInitData);
+        intStat.GetHist("int_hist.py");
+
+        // std::cout << "Check intCacheInitData RRS\n";
+        // std::this_thread::sleep_for(5s);
+
+        const auto uniqueKeysCount = intStat.UniqueCount();
+        std::cout << "Unique data count: " << uniqueKeysCount << '\n';
+        std::cout << "Initial cache fullness: " << 100 * std::min(uniqueKeysCount, benchCtx.CacheSize) / benchCtx.CacheSize << " %" << '\n';
+
+        std::cout << '\n';
+
+        const size_t intSeed = std::random_device{}(); // seed for both benchmarks must be the same
+        RunGetBenchmarkMultirhead<NUdf::EDataSlot::Int64, TYdbCacheSharded, THREAD_COUNT>("TYdbCache: i64", intCacheInitData, benchCtx, intSeed);
+        RunGetBenchmarkMultirhead<NUdf::EDataSlot::Int64, TConcurrentCache, THREAD_COUNT>("TConcurrentCache: i64", intCacheInitData, benchCtx, intSeed);
+    }
+
+    {
+        // TStringValue as a key, i64 as a value
+        NMiniKQL::TKeyPayloadPairVector stringValueCacheInitData;
+        for (size_t i = 0; i < INITIAL_KEYS_COUNT; ++i) {
+            stringValueCacheInitData.emplace_back(stringGenerator.NextKey(), i64Generator.NextKey());
+        }
+
+        // std::cout << "Check stringValueInitData RRS\n";
+        // std::this_thread::sleep_for(5s);
+
+        const size_t stringValueSeed = std::random_device{}(); // seed for both benchmarks must be the same
+        RunGetBenchmarkMultirhead<NUdf::EDataSlot::String, TYdbCacheSharded, THREAD_COUNT>("TYdbCache: TStringValue", stringValueCacheInitData, benchCtx, stringValueSeed);
+        RunGetBenchmarkMultirhead<NUdf::EDataSlot::String, TConcurrentCache, THREAD_COUNT>("TConcurrentCache: TStringValue", stringValueCacheInitData, benchCtx, stringValueSeed);
+    }
+}
+
+int main() {
+    //RunOneThreadBenchmarks();
+    RunMultipleThreadBenchmarks();
 }
