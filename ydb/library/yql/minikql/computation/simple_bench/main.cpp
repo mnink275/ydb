@@ -14,6 +14,71 @@
 
 using namespace NKikimr;
 
+namespace utils {
+
+struct Options {
+    size_t CacheSize;
+    double Mean;
+    double Stddev;
+    size_t ThreadCount;
+    std::optional<size_t> MakeStaleProbability;
+};
+
+Options GetOptions(int argc, char** argv) {
+    Options options{
+        .CacheSize = 0,
+        .Mean = 0.0,
+        .Stddev = 0.0,
+        .ThreadCount = 1,
+        .MakeStaleProbability = std::nullopt
+    };
+
+    for (int i = 1; i < argc; ++i) {
+        auto arg = std::string_view(argv[i]);
+        if (arg == "--cache-size" || arg == "-s") {
+            options.CacheSize = std::stoull(argv[++i]);
+        } else if (arg == "--mean" || arg == "-m") {
+            options.Mean = std::stod(argv[++i]);
+        } else if (arg == "--stddev" || arg == "-d") {
+            options.Stddev = std::stod(argv[++i]);
+        } else if (arg == "--thread-count" || arg == "-t") {
+            options.ThreadCount = std::stoull(argv[++i]);
+        } else if (arg == "--stale-probability" || arg == "-p") {
+            options.MakeStaleProbability = std::stoull(argv[++i]);
+            if (options.MakeStaleProbability > 100) throw std::runtime_error("Stale probability must be in range [0, 100]");
+        } else {
+            throw std::runtime_error("Unknown option: " + std::string(argv[i]));
+        }
+    }
+
+    if (options.CacheSize == 0) {
+        throw std::runtime_error("Cache size must be more than 0");
+    }
+
+    if (options.Stddev == 0.0) {
+        options.Stddev = options.CacheSize;
+    }
+
+    return options;
+}
+
+long PrintRSS() {
+    // https://stackoverflow.com/questions/669438/how-to-get-memory-usage-at-runtime-using-c
+    std::ifstream file("/proc/self/statm");
+    if (!file.is_open()) {
+        throw std::runtime_error("Can't open /proc/self/statm");
+    }
+
+    int tSize = 0, resident = 0, share = 0;
+    file >> tSize >> resident >> share;
+
+    long page_size_kb = sysconf(_SC_PAGE_SIZE) / 1024; // in case x86-64 is configured to use 2MB pages
+    double rss = resident * page_size_kb;
+    return static_cast<long>(rss) / 1024; // in MB
+}
+
+}  // namespace utils
+
 namespace {
 
 template <class T>
@@ -125,6 +190,26 @@ private:
     NMiniKQL::TScopedAlloc& Alloc;
 };
 
+
+class UniformStaleItemDecider final {
+public:
+    UniformStaleItemDecider(
+        i64 left = 0,
+        i64 right = 100,
+        size_t seed = std::random_device{}())
+        : Generator(seed),
+          Distribution(left, right) {};
+
+    size_t NextKey() {
+        auto genKey = Distribution(Generator);
+        return genKey;
+    }
+
+private:
+    std::mt19937 Generator;
+    std::uniform_int_distribution<size_t> Distribution;
+};
+
 class HashEqualUnboxedValue {
 public:
     HashEqualUnboxedValue(const NKikimr::NMiniKQL::TType* keyType)
@@ -145,12 +230,14 @@ private:
 template <NUdf::EDataSlot DataSlot, class TCache>
 class CacheFixture {
 public:
-    CacheFixture(size_t cacheSize, const NMiniKQL::TKeyPayloadPairVector& keys, size_t seed, double mean, double stddev)
+    CacheFixture(size_t cacheSize, const NMiniKQL::TKeyPayloadPairVector& keys, size_t seed, double mean, double stddev, std::optional<size_t> staleProbability)
         : Alloc(__LOCATION__),
           TypeEnv(Alloc),
           TypeBuilder(TypeEnv),
           Cache(cacheSize, TypeBuilder.NewDataType(DataSlot)),
-          KeysGenerator(Alloc, mean, stddev, seed) {
+          KeysGenerator(Alloc, mean, stddev, seed),
+          StaleItemDecider(0, 100, seed),
+          MakeStaleProbability(staleProbability) {
         for (auto& [key, value] : keys) {
             const auto now = std::chrono::steady_clock::now();
             const auto dt = std::chrono::minutes(1);
@@ -159,10 +246,25 @@ public:
     }
 
     void Get() {
-        const auto now = std::chrono::steady_clock::now();
-        // Cache.Prune(now); // does nothing because Entris are always not outdated
-        auto res = Cache.Get(KeysGenerator.NextKey(), now);
-        Y_DO_NOT_OPTIMIZE_AWAY(res);
+        auto now = std::chrono::steady_clock::now();
+        const auto key = KeysGenerator.NextKey();
+        if (!MakeStaleProbability) {
+            auto value = Cache.Get(NYql::NUdf::TUnboxedValuePod{key}, now);
+            Y_DO_NOT_OPTIMIZE_AWAY(value);
+            return;
+        }
+
+        bool make_stale = (StaleItemDecider.NextKey() < MakeStaleProbability);
+        // Cache.Prune(now);
+        auto value = Cache.Get(NYql::NUdf::TUnboxedValuePod{key}, now);
+        if (make_stale) {
+            static const auto LARGE_DURATION = std::chrono::hours(1);
+            auto res = Cache.Get(NYql::NUdf::TUnboxedValuePod{key}, now + LARGE_DURATION);
+            if (res) throw std::runtime_error("Stale item was found");
+            static const auto DB_REQUEST_MOCK_DURATION = std::chrono::milliseconds(3);
+            std::this_thread::sleep_for(DB_REQUEST_MOCK_DURATION);
+            Cache.Update(NYql::NUdf::TUnboxedValuePod{key}, NUdf::TUnboxedValuePod{0}, std::move(now));
+        }
     }
 
 private:
@@ -172,51 +274,28 @@ private:
     TCache Cache;
 
     NormalDistributionKeyGenerator<DataSlot> KeysGenerator;
+    UniformStaleItemDecider StaleItemDecider;
+    std::optional<size_t> MakeStaleProbability;
 };
 
-struct BenchContext {
-    const size_t CacheSize;
-    const double Mean;
-    const double Stddev;
-};
 
 template <NUdf::EDataSlot EDataSlot, class TCache>
-void RunGetBenchmark(TString name, auto& keys, BenchContext benchCtx, size_t seed = std::random_device{}()) {
-    using namespace std::chrono_literals;
-    std::cout << name << std::endl;
-
-    const auto benchmarkTime = 5s;
-
-    CacheFixture<EDataSlot, TCache> cacheFixture{benchCtx.CacheSize, keys, seed, benchCtx.Mean, benchCtx.Stddev};
-    auto start = std::chrono::high_resolution_clock::now();
-    ui64 count = 0;
-    while (std::chrono::high_resolution_clock::now() - start < benchmarkTime) {
-        cacheFixture.Get();
-        ++count;
+void RunGetBenchmarkMultirhead(TString name, auto& keys, utils::Options options, size_t seed = std::random_device{}()) {
+    if (options.ThreadCount > 1 && std::same_as<TCache, NMiniKQL::TUnboxedKeyValueLruCacheWithTtl>) {
+        throw std::runtime_error("TUnboxedKeyValueLruCacheWithTtl doesn't support multithreading");
     }
 
-    std::cout << "Get() count: " <<  count << std::endl;
-    std::cout << "Get() average time: "
-              << std::chrono::duration_cast<std::chrono::nanoseconds>(benchmarkTime).count() / count 
-              << " ns" << std::endl;
-    std::cout << std::endl;
-
-    //std::this_thread::sleep_for(5s);
-}
-
-
-template <NUdf::EDataSlot EDataSlot, class TCache, size_t ThreadCount>
-void RunGetBenchmarkMultirhead(TString name, auto& keys, BenchContext benchCtx, size_t seed = std::random_device{}()) {
     using namespace std::chrono_literals;
     std::cout << name << std::endl;
 
+    const auto beforeBenchmarkRSS =  utils::PrintRSS();
     const auto benchmarkTime = 5s;
 
-    CacheFixture<EDataSlot, TCache> cacheFixture{benchCtx.CacheSize, keys, seed, benchCtx.Mean, benchCtx.Stddev};
+    CacheFixture<EDataSlot, TCache> cacheFixture{options.CacheSize, keys, seed, options.Mean, options.Stddev, options.MakeStaleProbability};
     
     std::vector<std::thread> threads;
-    std::vector<ui64> counts(ThreadCount, 0);
-    for (size_t i = 0; i < ThreadCount; ++i) {
+    std::vector<ui64> counts(options.ThreadCount, 0);
+    for (size_t i = 0; i < options.ThreadCount; ++i) {
         threads.emplace_back([&cacheFixture, &counts, i, benchmarkTime] {
             NMiniKQL::TScopedAlloc thread_local_alloc{__LOCATION__};
 
@@ -232,102 +311,40 @@ void RunGetBenchmarkMultirhead(TString name, auto& keys, BenchContext benchCtx, 
         thread.join();
     }
 
+    const auto afterBenchmarkRSS = utils::PrintRSS();
+    std::cout << "RSS before: " << beforeBenchmarkRSS << " MB" << std::endl;
+    std::cout << "RSS after: " << afterBenchmarkRSS << " MB" << std::endl;
+    std::cout << "RSS: " << afterBenchmarkRSS - beforeBenchmarkRSS << " MB" << std::endl;
+
     ui64 sumCount = std::accumulate(counts.begin(), counts.end(), 0ull);
+    std::cout << "Data seed: " << seed << std::endl;
     std::cout << "Get() count: " << sumCount << std::endl;
     std::cout << "Get() average time: "
-              << std::chrono::duration_cast<std::chrono::nanoseconds>(benchmarkTime).count() / sumCount 
+              << options.ThreadCount * std::chrono::duration_cast<std::chrono::nanoseconds>(benchmarkTime).count() / sumCount 
               << " ns" << std::endl;
     std::cout << std::endl;
-
-    //std::this_thread::sleep_for(5s);
 }
 
 }
 
-void RunOneThreadBenchmarks() {
+int main(int argc, char** argv) {
     using namespace std::chrono_literals;
 
     NMiniKQL::TScopedAlloc main_alloc{__LOCATION__};
 
     using TYdbCache = NMiniKQL::TUnboxedKeyValueLruCacheWithTtl;
-    using TConcurrentCache = ConcurrentCacheWrapper<HashEqualUnboxedValue>;
-
-    BenchContext benchCtx{
-        .CacheSize = static_cast<size_t>(1e6),
-        .Mean = 0.0,
-        .Stddev = 0.5*1e6
-    };
-    const auto INITIAL_KEYS_COUNT = benchCtx.CacheSize * 2;
-
-    NormalDistributionKeyGenerator<NUdf::EDataSlot::Int64> i64Generator{main_alloc, benchCtx.Mean, benchCtx.Stddev};
-    NormalDistributionKeyGenerator<NUdf::EDataSlot::String> stringGenerator{main_alloc, benchCtx.Mean, benchCtx.Stddev};
-
-    std::cout << "Cache size: " << benchCtx.CacheSize << '\n';
-    std::cout << "Mean of normal distribution: " << benchCtx.Mean << '\n';
-    std::cout << "Standard deviation of normal distribution: " << benchCtx.Stddev << '\n';
-
-    {
-        // i64 as a key, i64 as a value
-        NMiniKQL::TKeyPayloadPairVector intCacheInitData;
-        for (size_t i = 0; i < INITIAL_KEYS_COUNT; ++i) {
-            intCacheInitData.emplace_back(i64Generator.NextKey(), i64Generator.NextKey());
-        }
-        Statistic<i64> intStat;
-        intStat.Load(intCacheInitData);
-        intStat.GetHist("int_hist.py");
-
-        // std::cout << "Check intCacheInitData RRS\n";
-        // std::this_thread::sleep_for(5s);
-
-        const auto uniqueKeysCount = intStat.UniqueCount();
-        std::cout << "Unique data count: " << uniqueKeysCount << '\n';
-        std::cout << "Initial cache fullness: " << 100 * std::min(uniqueKeysCount, benchCtx.CacheSize) / benchCtx.CacheSize << " %" << '\n';
-
-        std::cout << '\n';
-
-        const size_t intSeed = std::random_device{}(); // seed for both benchmarks must be the same
-        RunGetBenchmark<NUdf::EDataSlot::Int64, TYdbCache>("TYdbCache: i64", intCacheInitData, benchCtx, intSeed);
-        RunGetBenchmark<NUdf::EDataSlot::Int64, TConcurrentCache>("TConcurrentCache: i64", intCacheInitData, benchCtx, intSeed);
-    }
-
-    {
-        // TStringValue as a key, i64 as a value
-        NMiniKQL::TKeyPayloadPairVector stringValueCacheInitData;
-        for (size_t i = 0; i < INITIAL_KEYS_COUNT; ++i) {
-            stringValueCacheInitData.emplace_back(stringGenerator.NextKey(), i64Generator.NextKey());
-        }
-
-        // std::cout << "Check stringValueInitData RRS\n";
-        // std::this_thread::sleep_for(5s);
-
-        const size_t stringValueSeed = std::random_device{}(); // seed for both benchmarks must be the same
-        RunGetBenchmark<NUdf::EDataSlot::String, TYdbCache>("TYdbCache: TStringValue", stringValueCacheInitData, benchCtx, stringValueSeed);
-        RunGetBenchmark<NUdf::EDataSlot::String, TConcurrentCache>("TConcurrentCache: TStringValue", stringValueCacheInitData, benchCtx, stringValueSeed);
-    }
-}
-
-void RunMultipleThreadBenchmarks() {
-    using namespace std::chrono_literals;
-
-    NMiniKQL::TScopedAlloc main_alloc{__LOCATION__};
-
     using TYdbCacheSharded = NMiniKQL::TUnboxedValueLruCacheWithTTLSharded<256>;
     using TConcurrentCache = ConcurrentCacheWrapper<HashEqualUnboxedValue>;
 
-    BenchContext benchCtx{
-        .CacheSize = static_cast<size_t>(1e6),
-        .Mean = 0.0,
-        .Stddev = 1e6
-    };
-    const auto INITIAL_KEYS_COUNT = benchCtx.CacheSize * 2;
-    const auto THREAD_COUNT = 4;
+    auto options = utils::GetOptions(argc, argv);
+    const auto INITIAL_KEYS_COUNT = options.CacheSize * 2;
 
-    NormalDistributionKeyGenerator<NUdf::EDataSlot::Int64> i64Generator{main_alloc, benchCtx.Mean, benchCtx.Stddev};
-    NormalDistributionKeyGenerator<NUdf::EDataSlot::String> stringGenerator{main_alloc, benchCtx.Mean, benchCtx.Stddev};
+    NormalDistributionKeyGenerator<NUdf::EDataSlot::Int64> i64Generator{main_alloc, options.Mean, options.Stddev};
+    NormalDistributionKeyGenerator<NUdf::EDataSlot::String> stringGenerator{main_alloc, options.Mean, options.Stddev};
 
-    std::cout << "Cache size: " << benchCtx.CacheSize << '\n';
-    std::cout << "Mean of normal distribution: " << benchCtx.Mean << '\n';
-    std::cout << "Standard deviation of normal distribution: " << benchCtx.Stddev << '\n';
+    std::cout << "Cache size: " << options.CacheSize << '\n';
+    std::cout << "Mean of normal distribution: " << options.Mean << '\n';
+    std::cout << "Standard deviation of normal distribution: " << options.Stddev << '\n';
 
     {
         // i64 as a key, i64 as a value
@@ -339,18 +356,22 @@ void RunMultipleThreadBenchmarks() {
         intStat.Load(intCacheInitData);
         intStat.GetHist("int_hist.py");
 
-        // std::cout << "Check intCacheInitData RRS\n";
-        // std::this_thread::sleep_for(5s);
-
         const auto uniqueKeysCount = intStat.UniqueCount();
         std::cout << "Unique data count: " << uniqueKeysCount << '\n';
-        std::cout << "Initial cache fullness: " << 100 * std::min(uniqueKeysCount, benchCtx.CacheSize) / benchCtx.CacheSize << " %" << '\n';
+        std::cout << "Initial cache fullness: " << 100 * std::min(uniqueKeysCount, options.CacheSize) / options.CacheSize << " %" << '\n';
 
         std::cout << '\n';
 
+        std::cout << "Init i64 data RSS: " << utils::PrintRSS() << " MB" << std::endl;
+
+
         const size_t intSeed = std::random_device{}(); // seed for both benchmarks must be the same
-        RunGetBenchmarkMultirhead<NUdf::EDataSlot::Int64, TYdbCacheSharded, THREAD_COUNT>("TYdbCache: i64", intCacheInitData, benchCtx, intSeed);
-        RunGetBenchmarkMultirhead<NUdf::EDataSlot::Int64, TConcurrentCache, THREAD_COUNT>("TConcurrentCache: i64", intCacheInitData, benchCtx, intSeed);
+        if (options.ThreadCount == 1) {
+            RunGetBenchmarkMultirhead<NUdf::EDataSlot::Int64, TYdbCache>("TYdbCache: i64", intCacheInitData, options, intSeed);
+        } else {
+            RunGetBenchmarkMultirhead<NUdf::EDataSlot::Int64, TYdbCacheSharded>("TYdbCache: i64", intCacheInitData, options, intSeed);
+        }
+        RunGetBenchmarkMultirhead<NUdf::EDataSlot::Int64, TConcurrentCache>("TConcurrentCache: i64", intCacheInitData, options, intSeed);
     }
 
     {
@@ -360,16 +381,14 @@ void RunMultipleThreadBenchmarks() {
             stringValueCacheInitData.emplace_back(stringGenerator.NextKey(), i64Generator.NextKey());
         }
 
-        // std::cout << "Check stringValueInitData RRS\n";
-        // std::this_thread::sleep_for(5s);
+        std::cout << "Init StringValue data RSS: " << utils::PrintRSS() << " MB" << std::endl;
 
         const size_t stringValueSeed = std::random_device{}(); // seed for both benchmarks must be the same
-        RunGetBenchmarkMultirhead<NUdf::EDataSlot::String, TYdbCacheSharded, THREAD_COUNT>("TYdbCache: TStringValue", stringValueCacheInitData, benchCtx, stringValueSeed);
-        RunGetBenchmarkMultirhead<NUdf::EDataSlot::String, TConcurrentCache, THREAD_COUNT>("TConcurrentCache: TStringValue", stringValueCacheInitData, benchCtx, stringValueSeed);
+        if (options.ThreadCount == 1) {
+            RunGetBenchmarkMultirhead<NUdf::EDataSlot::String, TYdbCache>("TYdbCache: TStringValue", stringValueCacheInitData, options, stringValueSeed);
+        } else {
+            RunGetBenchmarkMultirhead<NUdf::EDataSlot::String, TYdbCacheSharded>("TYdbCache: TStringValue", stringValueCacheInitData, options, stringValueSeed);
+        }
+        RunGetBenchmarkMultirhead<NUdf::EDataSlot::String, TConcurrentCache>("TConcurrentCache: TStringValue", stringValueCacheInitData, options, stringValueSeed);
     }
-}
-
-int main() {
-    //RunOneThreadBenchmarks();
-    RunMultipleThreadBenchmarks();
 }
