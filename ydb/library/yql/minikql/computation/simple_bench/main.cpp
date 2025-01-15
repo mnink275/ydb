@@ -172,8 +172,8 @@ class NormalDistributionKeyGenerator final : public IKeysGenerator<DataSlot> {
 public:
     NormalDistributionKeyGenerator(
         NMiniKQL::TScopedAlloc& alloc,
-        double mean = 0.0,
-        double stddev = 10.0,
+        double mean,
+        double stddev,
         size_t seed = std::random_device{}())
         : Generator(seed),
           Distribution(mean, stddev),
@@ -190,19 +190,14 @@ private:
     NMiniKQL::TScopedAlloc& Alloc;
 };
 
-
 class UniformStaleItemDecider final {
 public:
-    UniformStaleItemDecider(
-        i64 left = 0,
-        i64 right = 100,
-        size_t seed = std::random_device{}())
+    UniformStaleItemDecider(size_t seed)
         : Generator(seed),
-          Distribution(left, right) {};
+          Distribution(1, 100) {};
 
     size_t NextKey() {
-        auto genKey = Distribution(Generator);
-        return genKey;
+        return Distribution(Generator);
     }
 
 private:
@@ -230,14 +225,14 @@ private:
 template <NUdf::EDataSlot DataSlot, class TCache>
 class CacheFixture {
 public:
-    CacheFixture(size_t cacheSize, const NMiniKQL::TKeyPayloadPairVector& keys, size_t seed, double mean, double stddev, std::optional<size_t> staleProbability)
-        : Alloc(__LOCATION__),
+    CacheFixture(NMiniKQL::TScopedAlloc& alloc, size_t cacheSize, const NMiniKQL::TKeyPayloadPairVector& keys, size_t seed, double mean, double stddev, std::optional<size_t> staleProbability)
+        : Alloc(alloc),
           TypeEnv(Alloc),
           TypeBuilder(TypeEnv),
           Cache(cacheSize, TypeBuilder.NewDataType(DataSlot)),
           KeysGenerator(Alloc, mean, stddev, seed),
-          StaleItemDecider(0, 100, seed),
-          MakeStaleProbability(staleProbability) {
+          MakeStaleProbability(staleProbability),
+          StaleItemDecider(seed) {
         for (auto& [key, value] : keys) {
             const auto now = std::chrono::steady_clock::now();
             const auto dt = std::chrono::minutes(1);
@@ -247,40 +242,44 @@ public:
 
     void Get() {
         auto now = std::chrono::steady_clock::now();
-        const auto key = KeysGenerator.NextKey();
+        auto key = KeysGenerator.NextKey();
         if (!MakeStaleProbability) {
-            auto value = Cache.Get(NYql::NUdf::TUnboxedValuePod{key}, now);
+            auto value = Cache.Get(NUdf::TUnboxedValuePod{key}, now);
             Y_DO_NOT_OPTIMIZE_AWAY(value);
             return;
         }
 
         bool make_stale = (StaleItemDecider.NextKey() < MakeStaleProbability);
         // Cache.Prune(now);
-        auto value = Cache.Get(NYql::NUdf::TUnboxedValuePod{key}, now);
         if (make_stale) {
             static const auto LARGE_DURATION = std::chrono::hours(1);
-            auto res = Cache.Get(NYql::NUdf::TUnboxedValuePod{key}, now + LARGE_DURATION);
-            if (res) throw std::runtime_error("Stale item was found");
-            static const auto DB_REQUEST_MOCK_DURATION = std::chrono::milliseconds(3);
-            std::this_thread::sleep_for(DB_REQUEST_MOCK_DURATION);
-            Cache.Update(NYql::NUdf::TUnboxedValuePod{key}, NUdf::TUnboxedValuePod{0}, std::move(now));
+
+            NUdf::TUnboxedValue new_key = key;
+            auto res = Cache.Get(NUdf::TUnboxedValue{key}, now + LARGE_DURATION);
+            Y_ASSERT(!res);
+            // static const auto DB_REQUEST_MOCK_DURATION = std::chrono::milliseconds(3);
+            // std::this_thread::sleep_for(DB_REQUEST_MOCK_DURATION);
+            Cache.Update(new_key.Release(), NUdf::TUnboxedValuePod{}, std::move(now));
+        } else {
+            auto value = Cache.Get(NUdf::TUnboxedValuePod{key}, now);
+            Y_DO_NOT_OPTIMIZE_AWAY(value);
         }
     }
 
 private:
-    NMiniKQL::TScopedAlloc Alloc;
+    NMiniKQL::TScopedAlloc& Alloc;
     NMiniKQL::TTypeEnvironment TypeEnv;
     NMiniKQL::TTypeBuilder TypeBuilder;
     TCache Cache;
 
     NormalDistributionKeyGenerator<DataSlot> KeysGenerator;
-    UniformStaleItemDecider StaleItemDecider;
     std::optional<size_t> MakeStaleProbability;
+    UniformStaleItemDecider StaleItemDecider;
 };
 
 
 template <NUdf::EDataSlot EDataSlot, class TCache>
-void RunGetBenchmarkMultirhead(TString name, auto& keys, utils::Options options, size_t seed = std::random_device{}()) {
+void RunGetBenchmark(TString name, auto& keys, utils::Options options, NMiniKQL::TScopedAlloc& alloc, size_t seed = std::random_device{}()) {
     if (options.ThreadCount > 1 && std::same_as<TCache, NMiniKQL::TUnboxedKeyValueLruCacheWithTtl>) {
         throw std::runtime_error("TUnboxedKeyValueLruCacheWithTtl doesn't support multithreading");
     }
@@ -291,20 +290,20 @@ void RunGetBenchmarkMultirhead(TString name, auto& keys, utils::Options options,
     const auto beforeBenchmarkRSS =  utils::PrintRSS();
     const auto benchmarkTime = 5s;
 
-    CacheFixture<EDataSlot, TCache> cacheFixture{options.CacheSize, keys, seed, options.Mean, options.Stddev, options.MakeStaleProbability};
+    CacheFixture<EDataSlot, TCache> cacheFixture{alloc, options.CacheSize, keys, seed, options.Mean, options.Stddev, options.MakeStaleProbability};
     
     std::vector<std::thread> threads;
     std::vector<ui64> counts(options.ThreadCount, 0);
     for (size_t i = 0; i < options.ThreadCount; ++i) {
-        threads.emplace_back([&cacheFixture, &counts, i, benchmarkTime] {
-            NMiniKQL::TScopedAlloc thread_local_alloc{__LOCATION__};
+        // threads.emplace_back([&cacheFixture, &counts, i, benchmarkTime] {
+        //     NMiniKQL::TScopedAlloc thread_local_alloc{__LOCATION__};
 
             auto start = std::chrono::high_resolution_clock::now();
             while (std::chrono::high_resolution_clock::now() - start < benchmarkTime) {
                 cacheFixture.Get();
                 ++counts[i];
             }
-        });
+        //});
     }
 
     for (auto& thread : threads) {
@@ -318,10 +317,15 @@ void RunGetBenchmarkMultirhead(TString name, auto& keys, utils::Options options,
 
     ui64 sumCount = std::accumulate(counts.begin(), counts.end(), 0ull);
     std::cout << "Data seed: " << seed << std::endl;
-    std::cout << "Get() count: " << sumCount << std::endl;
+    std::cout << "Get() calls within 5 seconds: " << sumCount << std::endl;
+
+    const auto averageTime = options.ThreadCount * std::chrono::duration_cast<std::chrono::nanoseconds>(benchmarkTime).count() / sumCount;
+    static const auto CPU_WORKING_CLOCK_GHz = 4.0;
+    static const auto CPU_TICK_TIME = 1 / CPU_WORKING_CLOCK_GHz;
     std::cout << "Get() average time: "
-              << options.ThreadCount * std::chrono::duration_cast<std::chrono::nanoseconds>(benchmarkTime).count() / sumCount 
-              << " ns" << std::endl;
+              << averageTime
+              << " ns (" << static_cast<ui64>(averageTime * CPU_TICK_TIME) << " ticks)" << std::endl;
+
     std::cout << std::endl;
 }
 
@@ -367,11 +371,11 @@ int main(int argc, char** argv) {
 
         const size_t intSeed = std::random_device{}(); // seed for both benchmarks must be the same
         if (options.ThreadCount == 1) {
-            RunGetBenchmarkMultirhead<NUdf::EDataSlot::Int64, TYdbCache>("TYdbCache: i64", intCacheInitData, options, intSeed);
+            RunGetBenchmark<NUdf::EDataSlot::Int64, TYdbCache>("TYdbCache: i64", intCacheInitData, options, main_alloc, intSeed);
         } else {
-            RunGetBenchmarkMultirhead<NUdf::EDataSlot::Int64, TYdbCacheSharded>("TYdbCache: i64", intCacheInitData, options, intSeed);
+            RunGetBenchmark<NUdf::EDataSlot::Int64, TYdbCacheSharded>("TYdbCacheSharded: i64", intCacheInitData, options, main_alloc, intSeed);
         }
-        RunGetBenchmarkMultirhead<NUdf::EDataSlot::Int64, TConcurrentCache>("TConcurrentCache: i64", intCacheInitData, options, intSeed);
+        RunGetBenchmark<NUdf::EDataSlot::Int64, TConcurrentCache>("TConcurrentCache: i64", intCacheInitData, options, main_alloc, intSeed);
     }
 
     {
@@ -385,10 +389,10 @@ int main(int argc, char** argv) {
 
         const size_t stringValueSeed = std::random_device{}(); // seed for both benchmarks must be the same
         if (options.ThreadCount == 1) {
-            RunGetBenchmarkMultirhead<NUdf::EDataSlot::String, TYdbCache>("TYdbCache: TStringValue", stringValueCacheInitData, options, stringValueSeed);
+            RunGetBenchmark<NUdf::EDataSlot::String, TYdbCache>("TYdbCache: TStringValue", stringValueCacheInitData, options, main_alloc, stringValueSeed);
         } else {
-            RunGetBenchmarkMultirhead<NUdf::EDataSlot::String, TYdbCacheSharded>("TYdbCache: TStringValue", stringValueCacheInitData, options, stringValueSeed);
+            RunGetBenchmark<NUdf::EDataSlot::String, TYdbCacheSharded>("TYdbCacheSharded: TStringValue", stringValueCacheInitData, options, main_alloc, stringValueSeed);
         }
-        RunGetBenchmarkMultirhead<NUdf::EDataSlot::String, TConcurrentCache>("TConcurrentCache: TStringValue", stringValueCacheInitData, options, stringValueSeed);
+        RunGetBenchmark<NUdf::EDataSlot::String, TConcurrentCache>("TConcurrentCache: TStringValue", stringValueCacheInitData, options, main_alloc, stringValueSeed);
     }
 }
