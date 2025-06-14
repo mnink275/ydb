@@ -57,16 +57,18 @@ inline void LoadArrayFromBuffer(const char* buffer,
 }
 
 inline uint32_t Now() {
+  static auto SteadyNowSinceEpoch = []{
+    return std::chrono::steady_clock::now().time_since_epoch(); };
   static const auto kTimeSinceEpoch =
-      std::chrono::steady_clock::now().time_since_epoch().count();
+      std::chrono::duration_cast<std::chrono::seconds>(SteadyNowSinceEpoch()).count();
   const auto seconds_since_epoch =
-      std::chrono::steady_clock::now().time_since_epoch().count();
+      std::chrono::duration_cast<std::chrono::seconds>(SteadyNowSinceEpoch()).count();
   assert(seconds_since_epoch >= 0);
-  assert(seconds_since_epoch > kTimeSinceEpoch);
+  assert(seconds_since_epoch >= kTimeSinceEpoch);
   return seconds_since_epoch - kTimeSinceEpoch;
 }
 
-class OFileStream : public IOutputStream  {
+class OFileStream : public IOutputStream {
  public:
   OFileStream(const std::string& filename)
     : output_(filename, std::ios_base::binary | std::ios_base::trunc) {}

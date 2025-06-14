@@ -12,38 +12,65 @@ using namespace NActors;
 struct TEvCache {
     enum EEv {
         EvGet = EventSpaceBegin(TEvents::ES_USERSPACE + 1),
+        EvGetResult,
+        EvLargePageNotLoaded,
         EvUpdate,
+        EvStorePage,
+        EvLoadPage,
+        EvSwapPage,
         EvTerminate
     };
 
     struct TEvGet : public TEventLocal<TEvGet, EvGet> {
         const ui32 Key;
         const ui32 Now;
-        cache::UV Value;
 
-        TEvGet(ui32 key, cache::UV&& value, ui32 now)
+        TEvGet(ui32 key, ui32 now)
             : Key(key)
             , Now(now)
-            , Value(value)
         {}
+    };
+
+    struct TEvGetResult : public TEventLocal<TEvGetResult, EvGetResult> {
+        const ui32 Key;
+        cache::UV Payload;
+
+        TEvGetResult(ui32 key, cache::UV&& payload)
+            : Key(key)
+            , Payload(std::move(payload)) {}
+    };
+
+    struct TEvLargePageNotLoaded : public TEventLocal<TEvLargePageNotLoaded, EvLargePageNotLoaded> {
+        const ui32 Key;
+
+        TEvLargePageNotLoaded(ui32 key) : Key(key) {}
     };
 
     struct TEvUpdate : public TEventLocal<TEvUpdate, EvUpdate> {
         const ui32 Key;
-        cache::UV Value;
+        cache::UV Payload;
         const ui32 Expiration;
 
-        TEvUpdate(ui32 key, cache::UV&& value, ui32 expiration)
+        TEvUpdate(ui32 key, cache::UV&& payload, ui32 expiration)
             : Key(key)
-            , Value(value)
+            , Payload(std::move(payload))
             , Expiration(expiration)
         {}
     };
 
-    struct TEvTerminate : public TEventLocal<TEvTerminate, EvTerminate> {
-        size_t KeyCount;
+    struct TEvSwap : public TEventLocal<TEvSwap, EvSwapPage> {
+        std::filesystem::path StorePath;
+        std::filesystem::path LoadPath;
 
-        TEvTerminate(size_t keyCount) : KeyCount(keyCount) {}
+        TEvSwap(std::filesystem::path&& storePath, std::filesystem::path&& loadPath)
+            : StorePath(storePath)
+            , LoadPath(loadPath) {}
+    };
+
+    struct TEvTerminate : public TEventLocal<TEvTerminate, EvTerminate> {
+        NActors::TActorId SenderId;
+
+        TEvTerminate(NActors::TActorId senderId) : SenderId(senderId) {}
     };
 };
 

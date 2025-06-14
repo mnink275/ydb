@@ -21,8 +21,7 @@ inline constexpr size_t LARGE_PAGE_SHIFT = 13;
 inline constexpr size_t SMALL_PAGE_SHIFT = 13;
 inline constexpr size_t SMALL_PAGE_SIZE_SHIFT = 5;
 
-#define USE_LRU_FLAG true
-inline constexpr double LRU_SIZE = 50'000;
+#define USE_LRU_FLAG false
 
 inline constexpr size_t TLFU_SIZE = 1000;
 inline constexpr size_t SAMPLE_SIZE = TLFU_SIZE * 10;
@@ -37,7 +36,7 @@ using TTinyLFU = TinyLFU<Key, SAMPLE_SIZE, TLFU_SIZE, USE_DOOR_KEEPER>;
 
 // Probability range: [0.0, 1.0]
 // Note: 0.0 - no TTL eviction
-constexpr auto TTL_EVICTION_PROB = 0.1;
+constexpr auto TTL_EVICTION_PROB = 0.0;
 
 // Eviction implemented via Bernoulli distribution
 // Set seed value or 0 to use random seed of Bernoulli distribution
@@ -86,5 +85,7 @@ inline const size_t FREQUENCY_THRESHOLD = 370;
 
 inline const size_t CACHE_SIZE =
     LOADED_PAGE_NUMBER * SMALL_PAGE_NUMBER * SMALL_PAGE_SIZE;
+
+inline constexpr double LRU_SIZE = CACHE_SIZE / 100.0;
 
 }  // namespace cache

@@ -1,3 +1,4 @@
+#include <thread>
 #include <unistd.h>
 #include <chrono>
 #include <fstream>
@@ -13,7 +14,7 @@
 #include <util/generic/xrange.h>
 #include <util/system/guard.h>
 
-#include "include/cache.hpp"
+#include "actors/page_based_cache.hpp"
 #include "events.hpp"
 
 using namespace std::chrono_literals;
@@ -94,145 +95,115 @@ struct BenchmarkResult {
 
 namespace ink::actor {
 
-class TPageBasedActor : public TActorBootstrapped<TPageBasedActor> {
-public:
-  TPageBasedActor(NKikimr::NMiniKQL::TScopedAlloc& alloc,
-                  const NKikimr::NMiniKQL::TTypeBuilder& typeBuilder,
-                  const NKikimr::NMiniKQL::THolderFactory& holderFactory)
-    : PageBasedCache(typeBuilder, holderFactory),
-      Alloc(alloc) {}
+class TBenchmarkActor : public TActorBootstrapped<TBenchmarkActor> {
+ public:
+  TBenchmarkActor(const std::string& filename, TActorId cacheActor)
+    : Filename(filename),
+      CacheActor(cacheActor) {}
 
-  ~TPageBasedActor() {
+  ~TBenchmarkActor() {
     Cout << "Total count: " << TotalCount << Endl;
     Cout << "Hit count: " << HitCount << Endl;
     if (TotalCount > 0) {
-      Cout << "Hit Ratio: " << 1.0 * HitCount / TotalCount << Endl;
+      Cout << "Hit ratio: "
+              << (100 * static_cast<double>(HitCount) / TotalCount) << " %"
+              << Endl;
     }
   }
 
   STFUNC(StateWait) {
     switch (ev->GetTypeRewrite()) {
-      hFunc(TEvCache::TEvGet, Handle);
-      hFunc(TEvCache::TEvUpdate, Handle);
       hFunc(TEvCache::TEvTerminate, Handle);
+      hFunc(TEvCache::TEvGetResult, Handle);
+      hFunc(TEvCache::TEvLargePageNotLoaded, Handle);
     }
 
     ++HandledEvents;
   }
 
   void Bootstrap() {
-    Become(&TThis::StateWait);
-  }
-
- private:
-  void Handle(TEvCache::TEvGet::TPtr& ev) {
-    auto guard = BindAllocator();
-
-    const auto start = std::chrono::high_resolution_clock::now();
-    const auto value = PageBasedCache.Get(ev->Get()->Key, ev->Get()->Now);
-    GetsTime += std::chrono::high_resolution_clock::now() - start;
-
-    if (value.HasValue()) {
-      HitCount++;
-    } else {
-      const auto start = std::chrono::high_resolution_clock::now();
-      PageBasedCache.Update(ev->Get()->Key, std::move(ev->Get()->Value), ev->Get()->Now + FarFuture);
-      UpdatesTime += std::chrono::high_resolution_clock::now() - start;
-    }
-
-    TotalCount++;
-  }
-
-  void Handle(TEvCache::TEvUpdate::TPtr& ev) {
-    auto guard = BindAllocator();
-
-    const auto start = std::chrono::high_resolution_clock::now();
-    PageBasedCache.Update(ev->Get()->Key, std::move(ev->Get()->Value), ev->Get()->Expiration);
-    UpdatesTime += std::chrono::high_resolution_clock::now() - start;
-  }
-
-  void Handle(TEvCache::TEvTerminate::TPtr& ev) {
-    Y_ASSERT(ev->Get()->KeyCount == TotalCount);
-
-    ShouldContinue.ShouldStop();
-  }
-
-  TGuard<NKikimr::NMiniKQL::TScopedAlloc> BindAllocator() {
-    return Guard(Alloc);
-  }
-
- private:
-  cache::Cache PageBasedCache;
-  NKikimr::NMiniKQL::TScopedAlloc& Alloc;
-
-  const ui32 FarFuture{3600}; // 1 hour
-
-  size_t HitCount{0};
-  size_t TotalCount{0};
-
-  std::chrono::high_resolution_clock::time_point GetsTime{0ns};
-  std::chrono::high_resolution_clock::time_point UpdatesTime{0ns};
-};
-
-
-class TBenchmarkActor : public TActorBootstrapped<TBenchmarkActor> {
- public:
-  TBenchmarkActor(NKikimr::NMiniKQL::TScopedAlloc& alloc,
-                 const std::string& filename, TActorId cacheActor)
-    : Alloc(alloc),
-      Filename(filename),
-      CacheActor(cacheActor) {}
-
-  void Bootstrap() {
     Cout << "Benchmark started" << Endl;
 
-    std::ifstream input(Filename);
+    std::ifstream input{Filename};
     if (!input.is_open()) {
       throw std::runtime_error("Can't open file");
     }
 
-    auto guard = BindAllocator();
-
-    const size_t kBatchSize = 700'000'000;
-    std::vector<uint32_t> benchmark_keys;
-    benchmark_keys.reserve(kBatchSize);
-    size_t keyCount = 0;
-
+    const size_t kBatchSize = 2 * (1ULL << 30); // 2 GB
     for (uint32_t key{}; input >> key;) {
-      keyCount++;
-
-      benchmark_keys.emplace_back(key);
-      if (benchmark_keys.size() == kBatchSize) {
-        SendBatch(std::move(benchmark_keys));
-
-        benchmark_keys.clear();
-        Cout << "Batch handled" << Endl;
+      BenchmarkKeys.push(key);
+      if (BenchmarkKeys.size() >= kBatchSize) {
+        throw std::runtime_error{"ALERT: dataset is larger than kBatchSize"};
       }
     }
-    if (!benchmark_keys.empty()) {
-      SendBatch(std::move(benchmark_keys));
-      Cout << "Batch handled" << Endl;
-    }
+    KeysNum = BenchmarkKeys.size();
 
     Cout << "Bootstrap Finished" << Endl;
-    Send(CacheActor, new TEvCache::TEvTerminate{keyCount});
+    Become(&TThis::StateWait);
+    SendNextKey();
   }
 
  private:
-  TGuard<NKikimr::NMiniKQL::TScopedAlloc> BindAllocator() {
-    return Guard(Alloc);
+  void Handle(TEvCache::TEvGetResult::TPtr& ev) {
+    auto& data = *ev->Get();
+    if (data.Payload.HasValue()) {
+      HitCount++;
+    } else {
+      SendUpdateEvent(data.Key);
+    }
+
+    if (TotalCount % 10'000'000 == 0) {
+      Cout << "Handled Get Results: " << TotalCount << Endl;
+    }
+
+    SendNextKey();
   }
 
-  void SendBatch(std::vector<uint32_t>&& keys) {
-    for (auto key : keys) {
-      Send(CacheActor, new TEvCache::TEvGet(key, cache::UVPod{key + 10}, utils::Now()));
+  void Handle(TEvCache::TEvLargePageNotLoaded::TPtr& ev) {
+    // TODO: this update emulates unexpected Pure C++ Cache version, that affects LargePages' frequency
+    SendUpdateEvent(ev->Get()->Key);
+
+    SendNextKey();
+  }
+
+  void Handle(TEvCache::TEvTerminate::TPtr&) {
+    if (++TerminatedLargePageActorsCount == cache::LOADED_PAGE_NUMBER) {
+      ShouldContinue.ShouldStop();
     }
   }
 
+  void SendUpdateEvent(const ui32 key) {
+    const auto expiration = utils::Now() + FarFuture;
+    Send(CacheActor, new TEvCache::TEvUpdate{key, cache::UVPod{key + 10}, expiration});
+  }
+
+  void SendNextKey() {
+    if (BenchmarkKeys.empty()) {
+      Send(CacheActor, new TEvCache::TEvTerminate{SelfId()});
+      return;
+    }
+
+    ++TotalCount;
+
+    const auto key = BenchmarkKeys.front();
+    BenchmarkKeys.pop();
+    Send(CacheActor, new TEvCache::TEvGet{key, utils::Now()});
+  }
+
  private:
-  NKikimr::NMiniKQL::TScopedAlloc& Alloc;
   std::string Filename;
   TActorId CacheActor;
+
+  const ui32 FarFuture{3600}; // 1 hour
+  size_t HitCount{0};
+  size_t TotalCount{0};
+  size_t KeysNum{0};
+
+  size_t TerminatedLargePageActorsCount{0};
+
+
+  std::chrono::high_resolution_clock::time_point StartBenchmarkTime{0ns};
+  std::queue<uint32_t> BenchmarkKeys;
 };
 
 }  // ink::actor
@@ -283,7 +254,7 @@ int main() {
 #endif
 
   std::string filename = "/home/ilyaeroshev/ydb/yql/essentials/minikql/computation/caches/dataset/P14.txt";
-  // std::string filename = "dataset/Financial1.txt";
+  // std::string filename = "/home/ilyaeroshev/ydb/yql/essentials/minikql/computation/caches/dataset/Financial1.txt";
 
 #ifdef _unix_
   signal(SIGPIPE, SIG_IGN);
@@ -299,8 +270,10 @@ int main() {
   const auto cacheActorId = actorSystem.Register(
     new ink::actor::TPageBasedActor{alloc, typeBuilder, holderFactory});
   const auto benchmarkActorId = actorSystem.Register(
-    new ink::actor::TBenchmarkActor{alloc, filename, cacheActorId});
-  Y_UNUSED(benchmarkActorId);
+    new ink::actor::TBenchmarkActor{filename, cacheActorId});
+
+  Cout << "Cache Actor ID: " << cacheActorId << Endl;
+  Cout << "Benchmark Actor ID: " << benchmarkActorId << Endl;
 
   alloc.Release();
   while (ShouldContinue.PollState() == TProgramShouldContinue::Continue) {

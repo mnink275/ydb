@@ -28,9 +28,9 @@ class Cache {
     if (auto value = lru_.Get(key, now)) return value;
 #endif
 
-    auto* maybe_large_page = provider_.Get</*CalledOnUpdate=*/false>(key);
+    auto maybe_large_page = provider_.Get</*CalledOnUpdate=*/false>(key);
 
-    if (maybe_large_page == nullptr) return EMPTY_UV;
+    if (!maybe_large_page.has_value()) return EMPTY_UV;
 
     return maybe_large_page->Get(key, now);
   }
@@ -45,9 +45,9 @@ class Cache {
     expiration_time = std::move(lru_evicted->expiration_time);
 #endif
 
-    auto* maybe_large_page = provider_.Get</*CalledOnUpdate=*/true>(key);
+    auto maybe_large_page = provider_.Get</*CalledOnUpdate=*/true>(key);
 
-    if (maybe_large_page == nullptr) return;
+    if (!maybe_large_page.has_value()) return;
 
     maybe_large_page->Update(key, std::move(value), expiration_time);
   }
