@@ -45,6 +45,8 @@ FederatedQuery::IamAuth::IdentityCase GetIamAuth(const FederatedQuery::Connectio
             return setting.mysql_cluster().auth().identity_case();
         case FederatedQuery::ConnectionSetting::kLogging:
             return setting.logging().auth().identity_case();
+        case FederatedQuery::ConnectionSetting::kIceberg:
+            return setting.iceberg().warehouse_auth().identity_case();
         case FederatedQuery::ConnectionSetting::CONNECTION_NOT_SET:
             return FederatedQuery::IamAuth::IDENTITY_NOT_SET;
     }
@@ -263,7 +265,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvCreateQuery
         );
     }
 
-    auto prepareParams = [=, as=TActivationContext::ActorSystem(), commonCounters=requestCounters.Common, quotas=event.Quotas](const std::vector<TResultSet>& resultSets) mutable {
+    auto prepareParams = [=, this, as=TActivationContext::ActorSystem(), commonCounters=requestCounters.Common, quotas=event.Quotas](const std::vector<TResultSet>& resultSets) mutable {
         const size_t countSets = (idempotencyKey ? 1 : 0) + (request.execute_mode() != FederatedQuery::SAVE ? 2 : 0);
         if (resultSets.size() != countSets) {
             ythrow NYql::TCodeLineException(TIssuesIds::INTERNAL_ERROR) << "Result set size is not equal to " << countSets << " but equal " << resultSets.size() << ". Please contact internal support";
@@ -371,7 +373,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvCreateQuery
         NActors::TActivationContext::ActorSystem(),
         status,
         SelfId(),
-        ev,
+        std::move(ev),
         startTime,
         requestCounters,
         prepare,
@@ -537,7 +539,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvListQueries
         NActors::TActivationContext::ActorSystem(),
         result,
         SelfId(),
-        ev,
+        std::move(ev),
         startTime,
         requestCounters,
         prepare,
@@ -683,7 +685,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvDescribeQue
         NActors::TActivationContext::ActorSystem(),
         result,
         SelfId(),
-        ev,
+        std::move(ev),
         startTime,
         requestCounters,
         prepare,
@@ -768,7 +770,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvGetQuerySta
         NActors::TActivationContext::ActorSystem(),
         result,
         SelfId(),
-        ev,
+        std::move(ev),
         startTime,
         requestCounters,
         prepare,
@@ -863,7 +865,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvModifyQuery
         "WHERE `" SCOPE_COLUMN_NAME "` = $scope AND `" QUERY_ID_COLUMN_NAME "` = $query_id AND (`" EXPIRE_AT_COLUMN_NAME "` is NULL OR `" EXPIRE_AT_COLUMN_NAME "` > $now);"
     );
 
-    auto prepareParams = [=, config=Config, commonCounters=requestCounters.Common](const std::vector<TResultSet>& resultSets) {
+    auto prepareParams = [=, this, config=Config, commonCounters=requestCounters.Common](const std::vector<TResultSet>& resultSets) {
         const size_t countSets = 1 + (request.execute_mode() != FederatedQuery::SAVE ? 2 : 0);
 
         if (resultSets.size() != countSets) {
@@ -1175,7 +1177,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvModifyQuery
         NActors::TActivationContext::ActorSystem(),
         result,
         SelfId(),
-        ev,
+        std::move(ev),
         startTime,
         requestCounters,
         prepare,
@@ -1292,7 +1294,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvDeleteQuery
         NActors::TActivationContext::ActorSystem(),
         result,
         SelfId(),
-        ev,
+        std::move(ev),
         startTime,
         requestCounters,
         prepare,
@@ -1353,7 +1355,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvControlQuer
         "WHERE `" SCOPE_COLUMN_NAME "` = $scope AND `" QUERY_ID_COLUMN_NAME "` = $query_id AND `" JOB_ID_COLUMN_NAME "` = $job_id;\n"
     );
 
-    auto prepareParams = [=, config=Config, commonCounters=requestCounters.Common](const std::vector<TResultSet>& resultSets) {
+    auto prepareParams = [=, this, config=Config, commonCounters=requestCounters.Common](const std::vector<TResultSet>& resultSets) {
         if (resultSets.size() != 2) {
             ythrow NYql::TCodeLineException(TIssuesIds::INTERNAL_ERROR) << "Result set size is not equal to 2 but equal " << resultSets.size() << ". Please contact internal support";
         }
@@ -1523,7 +1525,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvControlQuer
         NActors::TActivationContext::ActorSystem(),
         result,
         SelfId(),
-        ev,
+        std::move(ev),
         startTime,
         requestCounters,
         prepare,
@@ -1668,7 +1670,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvGetResultDa
         NActors::TActivationContext::ActorSystem(),
         result,
         SelfId(),
-        ev,
+        std::move(ev),
         startTime,
         requestCounters,
         prepare,
@@ -1801,7 +1803,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvListJobsReq
         NActors::TActivationContext::ActorSystem(),
         result,
         SelfId(),
-        ev,
+        std::move(ev),
         startTime,
         requestCounters,
         prepare,
@@ -1899,7 +1901,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvDescribeJob
         NActors::TActivationContext::ActorSystem(),
         result,
         SelfId(),
-        ev,
+        std::move(ev),
         startTime,
         requestCounters,
         prepare,

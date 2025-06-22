@@ -3,6 +3,7 @@
 #include "mkql_node_builder.h"
 #include "mkql_alloc.h"
 
+#include <yql/essentials/minikql/mkql_type_helper.h>
 #include <yql/essentials/public/udf/udf_type_ops.h>
 #include <yql/essentials/public/udf/arrow/block_item_comparator.h>
 #include <yql/essentials/public/udf/arrow/block_item_hasher.h>
@@ -1555,17 +1556,7 @@ bool ConvertArrowTypeImpl(NUdf::EDataSlot slot, std::shared_ptr<arrow::DataType>
     }
 }
 
-inline bool IsSingularType(const TType* type) {
-    return type->IsNull() ||
-           type->IsVoid() ||
-           type->IsEmptyDict() ||
-           type->IsEmptyList();
-}
-
-inline bool NeedWrapWithExternalOptional(const TType* type) {
-    return type->IsPg() || IsSingularType(type);
-}
-
+// TODO(YQL): This must be rewrited via traits dispatcher.
 bool ConvertArrowTypeImpl(TType* itemType, std::shared_ptr<arrow::DataType>& type, const TArrowConvertFailedCallback& onFail, bool output) {
     bool isOptional;
     auto unpacked = UnpackOptional(itemType, isOptional);
@@ -1578,7 +1569,7 @@ bool ConvertArrowTypeImpl(TType* itemType, std::shared_ptr<arrow::DataType>& typ
         return false;
     }
 
-    if (unpacked->IsOptional() || isOptional && NeedWrapWithExternalOptional(unpacked)) {
+    if (NeedWrapWithExternalOptional(itemType)) {
         ui32 nestLevel = 0;
         auto currentType = itemType;
         auto previousType = itemType;
@@ -1588,7 +1579,7 @@ bool ConvertArrowTypeImpl(TType* itemType, std::shared_ptr<arrow::DataType>& typ
             currentType = AS_TYPE(TOptionalType, currentType)->GetItemType();
         } while (currentType->IsOptional());
 
-        if (NeedWrapWithExternalOptional(currentType)) {
+        if (NeedWrapWithExternalOptional(previousType)) {
             previousType = currentType;
             ++nestLevel;
         }
@@ -1660,6 +1651,12 @@ bool ConvertArrowTypeImpl(TType* itemType, std::shared_ptr<arrow::DataType>& typ
         return true;
     }
 
+    if (itemType->IsTagged()) {
+        auto taggedType = AS_TYPE(TTaggedType, itemType);
+        auto baseType = taggedType->GetBaseType();
+        return ConvertArrowTypeImpl(baseType, type, onFail, output);
+    }
+
     if (IsSingularType(unpacked)) {
         type = arrow::null();
         return true;
@@ -1716,6 +1713,7 @@ void TArrowType::Export(ArrowSchema* out) const {
 // TFunctionTypeInfoBuilder
 //////////////////////////////////////////////////////////////////////////////
 TFunctionTypeInfoBuilder::TFunctionTypeInfoBuilder(
+        NYql::TLangVersion langver,
         const TTypeEnvironment& env,
         NUdf::ITypeInfoHelper::TPtr typeInfoHelper,
         const TStringBuf& moduleName,
@@ -1723,7 +1721,8 @@ TFunctionTypeInfoBuilder::TFunctionTypeInfoBuilder(
         const NUdf::TSourcePosition& pos,
         const NUdf::ISecureParamsProvider* secureParamsProvider,
         const NUdf::ILogProvider* logProvider)
-    : Env_(env)
+    : LangVer_(langver)
+    , Env_(env)
     , ReturnType_(nullptr)
     , RunConfigType_(Env_.GetTypeOfVoidLazy())
     , UserType_(Env_.GetTypeOfVoidLazy())
@@ -1828,6 +1827,18 @@ NUdf::TLoggerPtr TFunctionTypeInfoBuilder::MakeLogger(bool synchronized) const {
     }
 
     return ret;
+}
+
+void TFunctionTypeInfoBuilder::SetMinLangVer(ui32 langver) {
+    MinLangVer_ = langver;
+
+}
+void TFunctionTypeInfoBuilder::SetMaxLangVer(ui32 langver) {
+    MaxLangVer_ = langver;
+}
+
+ui32 TFunctionTypeInfoBuilder::GetCurrentLangVer() const {
+    return LangVer_;
 }
 
 NUdf::IFunctionTypeInfoBuilder1& TFunctionTypeInfoBuilder::ReturnsImpl(
@@ -1948,6 +1959,8 @@ void TFunctionTypeInfoBuilder::Build(TFunctionTypeInfo* funcInfo)
     funcInfo->IRFunctionName = std::move(IRFunctionName_);
     funcInfo->SupportsBlocks = SupportsBlocks_;
     funcInfo->IsStrict = IsStrict_;
+    funcInfo->MinLangVer = MinLangVer_;
+    funcInfo->MaxLangVer = MaxLangVer_;
 }
 
 NUdf::TType* TFunctionTypeInfoBuilder::Primitive(NUdf::TDataTypeId typeId) const
@@ -2544,6 +2557,11 @@ size_t CalcMaxBlockItemSize(const TType* type) {
 
     if (IsSingularType(type)) {
         return 0;
+    }
+
+    if (type->IsTagged()) {
+        auto taggedType = AS_TYPE(TTaggedType, type);
+        return CalcMaxBlockItemSize(taggedType->GetBaseType());
     }
 
     if (type->IsData()) {

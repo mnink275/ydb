@@ -96,6 +96,7 @@ message TReplicationConfig {
         }
         optional TTarget Target = 1;
         optional TBatchingSettings Batching = 2;
+        optional string RunAsUser = 3;
     }
 
     optional TConnectionParams SrcConnectionParams = 1;
@@ -155,6 +156,7 @@ message TEvCreateReplication {
     optional NKikimrProto.TPathID PathId = 1;
     optional TOperationId OperationId = 2;
     optional TReplicationConfig Config = 3;
+    optional string Database = 4;
 }
 
 message TEvCreateReplicationResult {
@@ -258,6 +260,7 @@ message TTransferWriterSettings {
     optional NKikimrProto.TPathID PathId = 1;
     optional string TransformLambda = 2;
     optional TBatchingSettings Batching = 3;
+    optional string RunAsUser = 4;
 }
 
 message TRunWorkerCommand {
@@ -271,6 +274,7 @@ message TRunWorkerCommand {
     }
 
     optional TConsistencySettings ConsistencySettings = 3;
+    optional string Database = 5;
 }
 
 message TEvRunWorker {

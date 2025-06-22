@@ -18,6 +18,8 @@
 #include "request_migrator.h"
 #include "readers.h"
 
+#include <library/cpp/threading/future/core/coroutine_traits.h>
+
 
 namespace NYdb::inline Dev {
 namespace NTable {
@@ -136,7 +138,7 @@ public:
 
     void SetStatCollector(const NSdkStats::TStatCollector::TClientStatCollector& collector);
 
-    TAsyncBulkUpsertResult BulkUpsert(const std::string& table, TValue&& rows, const TBulkUpsertSettings& settings);
+    TAsyncBulkUpsertResult BulkUpsert(const std::string& table, TValue&& rows, const TBulkUpsertSettings& settings, bool canMove);
     TAsyncBulkUpsertResult BulkUpsert(const std::string& table, EDataFormat format,
         const std::string& data, const std::string& schema, const TBulkUpsertSettings& settings);
 
@@ -179,24 +181,30 @@ private:
         const TExecDataQuerySettings& settings, bool fromCache
     ) {
         if (!txControl.Tx_.has_value() || !txControl.CommitTx_) {
-            return ExecuteDataQueryInternal(session, query, txControl, params, settings, fromCache);
+            co_return co_await AsExtractingAwaitable(ExecuteDataQueryInternal(session, query, txControl, params, settings, fromCache));
         }
 
-        auto onPrecommitCompleted = [this, session, query, txControl, params, settings, fromCache](const NThreading::TFuture<TStatus>& f) {
-            TStatus status = f.GetValueSync();
-            if (!status.IsSuccess()) {
-                return NThreading::MakeFuture(TDataQueryResult(std::move(status),
-                                                               {},
-                                                               txControl.Tx_,
-                                                               std::nullopt,
-                                                               false,
-                                                               std::nullopt));
-            }
+        auto sessionCopy = session;
+        auto settingsCopy = settings;
+        auto queryCopy = query;
+        auto txControlCopy = txControl;
+        auto paramsCopy = params;
 
-            return ExecuteDataQueryInternal(session, query, txControl, params, settings, fromCache);
-        };
+        auto status = co_await txControlCopy.Tx_->Precommit();
 
-        return txControl.Tx_->Precommit().Apply(onPrecommitCompleted);
+        if (!status.IsSuccess()) {
+            co_return TDataQueryResult(std::move(status), {}, txControlCopy.Tx_, std::nullopt, false, std::nullopt);
+        }
+
+        auto dataQueryResult = co_await AsExtractingAwaitable(ExecuteDataQueryInternal(sessionCopy, queryCopy, txControlCopy, paramsCopy, settingsCopy, fromCache));
+
+        if (!dataQueryResult.IsSuccess()) {
+            co_await txControlCopy.Tx_->ProcessFailure();
+
+            co_return std::move(dataQueryResult);
+        }
+
+        co_return std::move(dataQueryResult);
     }
 
     template <typename TQueryType, typename TParamsType>

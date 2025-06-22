@@ -1548,8 +1548,8 @@ private:
         dqConfiguration->FallbackPolicy = EFallbackPolicy::Never;
 
         bool enableCheckpointCoordinator =
-            Params.QueryType == FederatedQuery::QueryContent::STREAMING && 
-            Params.Config.GetCheckpointCoordinator().GetEnabled() && 
+            Params.QueryType == FederatedQuery::QueryContent::STREAMING &&
+            Params.Config.GetCheckpointCoordinator().GetEnabled() &&
             !dqConfiguration->DisableCheckpoints.Get().GetOrElse(false);
 
         ExecuterId = Register(NYql::NDq::MakeDqExecuter(MakeNodesManagerId(), SelfId(), Params.QueryId, "", dqConfiguration, QueryCounters.Counters, TInstant::Now(), enableCheckpointCoordinator));
@@ -1953,15 +1953,20 @@ private:
         *gatewaysConfig.MutableGeneric() = Params.Config.GetGateways().GetGeneric();
         gatewaysConfig.MutableGeneric()->ClearClusterMapping();
 
+        *gatewaysConfig.MutableSolomon() = Params.Config.GetGateways().GetSolomon();
+        gatewaysConfig.MutableSolomon()->ClearClusterMapping();
+
         THashMap<TString, TString> clusters;
 
-        TString monitoringEndpoint = Params.Config.GetCommon().GetMonitoringEndpoint();
+        TString monitoringHttpEndpoint = Params.Config.GetCommon().GetMonitoringReadHttpEndpoint();
+        TString monitoringGrpcEndpoint = Params.Config.GetCommon().GetMonitoringReadGrpcEndpoint();
 
         //todo: consider cluster name clashes
         AddClustersFromConfig(gatewaysConfig, clusters);
         AddClustersFromConnections(Params.Config.GetCommon(),
             YqConnections,
-            monitoringEndpoint,
+            monitoringHttpEndpoint,
+            monitoringGrpcEndpoint,
             Params.AuthToken,
             Params.AccountIdSignatures,
             // out params:
@@ -1995,7 +2000,27 @@ private:
         {
             auto pqGateway = Params.PqGatewayFactory->CreatePqGateway();
             pqGateway->UpdateClusterConfigs(std::make_shared<NYql::TPqGatewayConfig>(gatewaysConfig.GetPq()));
-            dataProvidersInit.push_back(GetPqDataProviderInitializer(pqGateway, false, dbResolver));
+            NYql::NPq::NProto::StreamingDisposition disposition;
+            switch (Params.StreamingDisposition.GetDispositionCase()) {
+                case FederatedQuery::StreamingDisposition::kOldest:
+                    *disposition.mutable_oldest() = Params.StreamingDisposition.oldest();
+                    break;
+                case FederatedQuery::StreamingDisposition::kFresh:
+                    *disposition.mutable_fresh() = Params.StreamingDisposition.fresh();
+                    break;
+                case FederatedQuery::StreamingDisposition::kFromTime:
+                    *disposition.mutable_from_time()->mutable_timestamp() = Params.StreamingDisposition.from_time().timestamp();
+                    break;
+                case FederatedQuery::StreamingDisposition::kTimeAgo:
+                    *disposition.mutable_time_ago()->mutable_duration() = Params.StreamingDisposition.time_ago().duration();
+                    break;
+                case FederatedQuery::StreamingDisposition::kFromLastCheckpoint:
+                    disposition.mutable_from_last_checkpoint()->set_force(Params.StreamingDisposition.from_last_checkpoint().force());
+                    break;
+                case FederatedQuery::StreamingDisposition::DISPOSITION_NOT_SET:
+                    break;
+            }
+            dataProvidersInit.push_back(GetPqDataProviderInitializer(pqGateway, false, dbResolver, std::move(disposition)));
         }
 
         {

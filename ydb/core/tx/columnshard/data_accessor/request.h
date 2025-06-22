@@ -15,6 +15,15 @@ private:
     THashMap<ui64, TPortionDataAccessor> PortionsById;
 
 public:
+    TDataAccessorsResult() = default;
+
+    TDataAccessorsResult(std::vector<TPortionDataAccessor>&& portions) {
+        for (auto&& i : portions) {
+            const ui64 portionId = i.GetPortionInfo().GetPortionId();
+            PortionsById.emplace(portionId, std::move(i));
+        }
+    }
+
     const THashMap<ui64, TPortionDataAccessor>& GetPortions() const {
         return PortionsById;
     }
@@ -41,6 +50,14 @@ public:
         auto it = PortionsById.find(portionId);
         AFL_VERIFY(it != PortionsById.end());
         return it->second;
+    }
+
+    TPortionDataAccessor ExtractPortionAccessorVerified(const ui64 portionId) {
+        auto it = PortionsById.find(portionId);
+        AFL_VERIFY(it != PortionsById.end());
+        auto result = std::move(it->second);
+        PortionsById.erase(it);
+        return result;
     }
 
     void AddData(THashMap<ui64, TPortionDataAccessor>&& accessors) {
@@ -127,7 +144,7 @@ public:
         return sb;
     }
 
-    TPathFetchingState(const TInternalPathId pathId)
+    explicit TPathFetchingState(const TInternalPathId pathId)
         : PathId(pathId) {
     }
 
@@ -286,11 +303,12 @@ public:
         AFL_VERIFY(portion);
         AFL_VERIFY(FetchStage <= 1);
         AFL_VERIFY(PortionIds.emplace(portion->GetPortionId()).second);
-        PathIds.emplace(portion->GetPathId());
-        auto it = PathIdStatus.find(portion->GetPathId());
+        const auto& pathId = portion->GetPathId();
+        PathIds.emplace(pathId);
+        auto it = PathIdStatus.find(pathId);
         if (it == PathIdStatus.end()) {
             PreparingCount.Inc();
-            it = PathIdStatus.emplace(portion->GetPathId(), portion->GetPathId()).first;
+            it = PathIdStatus.emplace(pathId, TPathFetchingState{pathId}).first;
         }
         it->second.AddPortion(portion);
     }

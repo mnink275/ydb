@@ -13,6 +13,7 @@ NProto::THeartbeatRequest HeartbeatRequestToProto(const THeartbeatRequest& heart
         protoHeartbeatRequest.AddTaskStates();
         protoHeartbeatRequest.MutableTaskStates(i)->Swap(&protoTaskState);
     }
+    protoHeartbeatRequest.SetAvailableSlots(heartbeatRequest.AvailableSlots);
     return protoHeartbeatRequest;
 }
 
@@ -26,6 +27,7 @@ THeartbeatRequest HeartbeatRequestFromProto(const NProto::THeartbeatRequest prot
         taskStates.emplace_back(TIntrusivePtr<TTaskState>(new TTaskState(curTaskState)));
     }
     heartbeatRequest.TaskStates = taskStates;
+    heartbeatRequest.AvailableSlots = protoHeartbeatRequest.GetAvailableSlots();
     return heartbeatRequest;
 }
 
@@ -39,6 +41,7 @@ NProto::THeartbeatResponse HeartbeatResponseToProto(const THeartbeatResponse& he
     for (auto& id: heartbeatResponse.TaskToDeleteIds) {
         protoHeartbeatResponse.AddTaskToDeleteIds(id);
     }
+    protoHeartbeatResponse.SetNeedToRestart(heartbeatResponse.NeedToRestart);
     return protoHeartbeatResponse;
 }
 
@@ -56,6 +59,7 @@ THeartbeatResponse HeartbeatResponseFromProto(const NProto::THeartbeatResponse& 
 
     heartbeatResponse.TasksToRun = tasksToRun;
     heartbeatResponse.TaskToDeleteIds = taskToDeleteIds;
+    heartbeatResponse.NeedToRestart = protoHeartbeatResponse.GetNeedToRestart();
     return heartbeatResponse;
 }
 
@@ -70,8 +74,10 @@ NProto::TStartOperationRequest StartOperationRequestToProto(const TStartOperatio
         protoStartOperationRequest.SetIdempotencyKey(*startOperationRequest.IdempotencyKey);
     }
     protoStartOperationRequest.SetNumRetries(startOperationRequest.NumRetries);
-    auto protoClusterConnection = ClusterConnectionToProto(startOperationRequest.ClusterConnection);
-    protoStartOperationRequest.MutableClusterConnection()->Swap(&protoClusterConnection);
+    auto& clusterConnections = *protoStartOperationRequest.MutableClusterConnections();
+    for (auto& [tableName, conn]: startOperationRequest.ClusterConnections) {
+        clusterConnections[tableName.Id] = ClusterConnectionToProto(conn);
+    }
     if (startOperationRequest.FmrOperationSpec) {
         protoStartOperationRequest.SetFmrOperationSpec(NYT::NodeToYsonString(*startOperationRequest.FmrOperationSpec));
     }
@@ -87,7 +93,11 @@ TStartOperationRequest StartOperationRequestFromProto(const NProto::TStartOperat
         startOperationRequest.IdempotencyKey = protoStartOperationRequest.GetIdempotencyKey();
     }
     startOperationRequest.NumRetries = protoStartOperationRequest.GetNumRetries();
-    startOperationRequest.ClusterConnection = ClusterConnectionFromProto(protoStartOperationRequest.GetClusterConnection());
+    std::unordered_map<TFmrTableId, TClusterConnection> startOperationRequestClusterConnections;
+    for (auto& [tableName, conn]: protoStartOperationRequest.GetClusterConnections()) {
+        startOperationRequestClusterConnections[tableName] = ClusterConnectionFromProto(conn);
+    }
+    startOperationRequest.ClusterConnections = startOperationRequestClusterConnections;
     if (protoStartOperationRequest.HasFmrOperationSpec()) {
         startOperationRequest.FmrOperationSpec = NYT::NodeFromYsonString(protoStartOperationRequest.GetFmrOperationSpec());
     }
@@ -116,6 +126,11 @@ NProto::TGetOperationResponse GetOperationResponseToProto(const TGetOperationRes
         auto protoError = FmrErrorToProto(errorMessage);
         curError->Swap(&protoError);
     }
+    for (auto& tableStats: getOperationResponse.OutputTablesStats) {
+        auto* curTableStats = protoGetOperationResponse.AddTableStats();
+        auto protoTableStats = TableStatsToProto(tableStats);
+        curTableStats->Swap(&protoTableStats);
+    }
     return protoGetOperationResponse;
 }
 
@@ -123,11 +138,17 @@ TGetOperationResponse GetOperationResponseFromProto(const NProto::TGetOperationR
     TGetOperationResponse getOperationResponse;
     getOperationResponse.Status = static_cast<EOperationStatus>(protoGetOperationReponse.GetStatus());
     std::vector<TFmrError> errorMessages;
+    std::vector<TTableStats> outputTableStats;
     for (size_t i = 0; i < protoGetOperationReponse.ErrorMessagesSize(); ++i) {
         TFmrError errorMessage = FmrErrorFromProto(protoGetOperationReponse.GetErrorMessages(i));
         errorMessages.emplace_back(errorMessage);
     }
+    for (size_t i = 0; i < protoGetOperationReponse.TableStatsSize(); ++i) {
+        TTableStats tableStats = TableStatsFromProto(protoGetOperationReponse.GetTableStats(i));
+        outputTableStats.emplace_back(tableStats);
+    }
     getOperationResponse.ErrorMessages = errorMessages;
+    getOperationResponse.OutputTablesStats = outputTableStats;
     return getOperationResponse;
 }
 
@@ -173,6 +194,16 @@ TGetFmrTableInfoResponse GetFmrTableInfoResponseFromProto(const NProto::TGetFmrT
     }
     getFmrTableInfoResponse.ErrorMessages = errorMessages;
     return getFmrTableInfoResponse;
+}
+
+NProto::TClearSessionRequest ClearSessionRequestToProto(const TClearSessionRequest& request) {
+    NProto::TClearSessionRequest protoRequest;
+    protoRequest.SetSessionId(request.SessionId);
+    return protoRequest;
+}
+
+TClearSessionRequest ClearSessionRequestFromProto(const NProto::TClearSessionRequest& protoRequest) {
+    return TClearSessionRequest{.SessionId = protoRequest.GetSessionId()};
 }
 
 } // namespace NYql::NFmr

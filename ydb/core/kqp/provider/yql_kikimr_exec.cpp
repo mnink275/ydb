@@ -100,18 +100,62 @@ namespace {
         return permissionsSettings;
     }
 
+    bool ParseInteger(const TMaybeNode<TExprBase>& value, ui64& extracted) {
+        if (!value.Maybe<TCoIntegralCtor>()) {
+            return false;
+        }
+        bool hasSign;
+        bool isSigned;
+        ExtractIntegralValue(value.Ref(), false, hasSign, isSigned, extracted);
+        if (hasSign || extracted == 0) {
+            return false;
+        }
+        return true;
+    }
+
     TAlterDatabaseSettings ParseAlterDatabaseSettings(TKiAlterDatabase alterDatabase) {
         TAlterDatabaseSettings alterDatabaseSettings;
         YQL_ENSURE(alterDatabase.DatabasePath().Value().size() > 0);
         alterDatabaseSettings.DatabasePath = alterDatabase.DatabasePath().Value();
+        auto& schemeLimits = alterDatabaseSettings.SchemeLimits;
 
         for (auto setting : alterDatabase.Settings()) {
             const auto& name = setting.Name().Value();
 
             if (name == "owner") {
                 alterDatabaseSettings.Owner = setting.Value().Cast<TCoAtom>().StringValue();
-            } else {
-                YQL_ENSURE(false);
+            }
+            if (name == "MAX_SHARDS") {
+                ui64 value;
+                YQL_ENSURE(ParseInteger(setting.Value(), value));
+                if (!schemeLimits) {
+                    schemeLimits.emplace();
+                }
+                schemeLimits->SetMaxShards(value);
+            }
+            if (name == "MAX_SHARDS_IN_PATH") {
+                ui64 value;
+                YQL_ENSURE(ParseInteger(setting.Value(), value));
+                if (!schemeLimits) {
+                    schemeLimits.emplace();
+                }
+                schemeLimits->SetMaxShardsInPath(value);
+            }
+            if (name == "MAX_PATHS") {
+                ui64 value;
+                YQL_ENSURE(ParseInteger(setting.Value(), value));
+                if (!schemeLimits) {
+                    schemeLimits.emplace();
+                }
+                schemeLimits->SetMaxPaths(value);
+            }
+            if (name == "MAX_CHILDREN_IN_DIR") {
+                ui64 value;
+                YQL_ENSURE(ParseInteger(setting.Value(), value));
+                if (!schemeLimits) {
+                    schemeLimits.emplace();
+                }
+                schemeLimits->SetMaxChildrenInDir(value);
             }
         }
 
@@ -696,6 +740,28 @@ namespace {
                 return false;
             }
         }
+        return true;
+    }
+
+    [[nodiscard]] bool ParseReadReplicasSettings(
+        Ydb::Table::ReadReplicasSettings& readReplicasSettings,
+        const TCoNameValueTuple& setting,
+        TExprContext& ctx
+    ) {
+        const auto replicasSettings = TString(
+            setting.Value().Cast<TCoDataCtor>().Literal().Cast<TCoAtom>().Value()
+        );
+
+        Ydb::StatusIds::StatusCode code;
+        TString errText;
+        if (!ConvertReadReplicasSettingsToProto(replicasSettings, readReplicasSettings, code, errText)) {
+
+            ctx.AddError(YqlIssue(ctx.GetPosition(setting.Value().Cast<TCoDataCtor>().Literal().Cast<TCoAtom>().Pos()),
+                                  NYql::YqlStatusFromYdbStatus(code),
+                                  errText));
+            return false;
+        }
+
         return true;
     }
 
@@ -1783,17 +1849,7 @@ public:
                             }
 
                         } else if (name == "readReplicasSettings") {
-                            const auto replicasSettings = TString(
-                                setting.Value().Cast<TCoDataCtor>().Literal().Cast<TCoAtom>().Value()
-                            );
-                            Ydb::StatusIds::StatusCode code;
-                            TString errText;
-                            if (!ConvertReadReplicasSettingsToProto(replicasSettings,
-                                 *alterTableRequest.mutable_set_read_replicas_settings(), code, errText)) {
-
-                                ctx.AddError(YqlIssue(ctx.GetPosition(setting.Value().Cast<TCoDataCtor>().Literal().Cast<TCoAtom>().Pos()),
-                                                      NYql::YqlStatusFromYdbStatus(code),
-                                                      errText));
+                            if (!ParseReadReplicasSettings(*alterTableRequest.mutable_set_read_replicas_settings(), setting, ctx)) {
                                 return SyncError();
                             }
                         } else if (name == "setTtlSettings") {
@@ -1830,6 +1886,8 @@ public:
                             const auto type = TString(columnTuple.Item(1).Cast<TCoAtom>().Value());
                             if (type == "syncGlobal") {
                                 add_index->mutable_global_index();
+                            } else if (type == "syncGlobalUnique") {
+                                add_index->mutable_global_unique_index();
                             } else if (type == "asyncGlobal") {
                                 add_index->mutable_global_async_index();
                             } else if (type == "globalVectorKmeansTree") {
@@ -1944,10 +2002,15 @@ public:
                         } else if (settingName == "tableSettings") {
                             auto tableSettings = indexSetting.Value().Cast<TCoNameValueTupleList>();
                             for (const auto& tableSetting : tableSettings) {
-                                if (IsPartitioningSetting(tableSetting.Name().Value())) {
+                                const auto name = tableSetting.Name().Value();
+                                if (IsPartitioningSetting(name)) {
                                     if (!ParsePartitioningSettings(
                                         *alterTableRequest.mutable_alter_partitioning_settings(), tableSetting, ctx
                                     )) {
+                                        return SyncError();
+                                    }
+                                } else if (name == "readReplicasSettings") {
+                                    if (!ParseReadReplicasSettings(*alterTableRequest.mutable_set_read_replicas_settings(), tableSetting, ctx)) {
                                         return SyncError();
                                     }
                                 } else {
@@ -2047,6 +2110,12 @@ public:
                                     const auto interval = TDuration::FromValue(value);
                                     auto& resolvedTimestamps = *add_changefeed->mutable_resolved_timestamps_interval();
                                     resolvedTimestamps.set_seconds(interval.Seconds());
+                                } else if (name == "schema_changes") {
+                                    auto value = TString(
+                                        setting.Value().Cast<TCoDataCtor>().Literal().Cast<TCoAtom>().Value()
+                                    );
+
+                                    add_changefeed->set_schema_changes(FromString<bool>(to_lower(value)));
                                 } else if (name == "retention_period") {
                                     YQL_ENSURE(setting.Value().Maybe<TCoInterval>());
                                     const auto value = FromString<i64>(
@@ -2455,7 +2524,7 @@ public:
                 return SyncError();
             }
 
-            if (!settings.Settings.ConnectionString && (!settings.Settings.Endpoint || !settings.Settings.Database)) {
+            if (!settings.Settings.Endpoint ^ !settings.Settings.Database) {
                 ctx.AddError(TIssue(ctx.GetPosition(createTransfer.Pos()),
                     "Neither CONNECTION_STRING nor ENDPOINT/DATABASE are provided"));
                 return SyncError();

@@ -7,6 +7,7 @@
 #include <yql/essentials/providers/common/codec/yql_codec_type_flags.h>
 #include <yql/essentials/providers/result/expr_nodes/yql_res_expr_nodes.h>
 
+#include <yql/essentials/utils/log/log.h>
 #include <yql/essentials/core/yql_opt_utils.h>
 #include <yql/essentials/core/yql_type_helpers.h>
 
@@ -962,6 +963,45 @@ TMaybeNode<TExprBase> TYtPhysicalOptProposalTransformer::UpdateDataSourceCluster
     }
 
     return ctx.ChangeChild(node.Ref(), TYtReadTable::idx_DataSource, MakeDataSource(op.DataSource().Pos(), cluster, ctx).Ptr());
+}
+
+TMaybeNode<TExprBase> TYtPhysicalOptProposalTransformer::PushPruneKeysIntoYtOperation(TExprBase node, TExprContext& ctx) const {
+    auto op = node.Cast<TCoPruneKeysBase>();
+    auto extractorLambda = op.Extractor();
+
+    if (!IsYtProviderInput(op.Input())) {
+        return node;
+    }
+
+    TSyncMap syncList;
+    const ERuntimeClusterSelectionMode selectionMode =
+        State_->Configuration->RuntimeClusterSelection.Get().GetOrElse(DEFAULT_RUNTIME_CLUSTER_SELECTION);
+    auto cluster = DeriveClusterFromInput(op.Input(), selectionMode);
+    if (!cluster || !IsYtCompleteIsolatedLambda(extractorLambda.Ref(), syncList, *cluster, false, selectionMode)) {
+        return {};
+    }
+
+    auto outItemType = SilentGetSequenceItemType(op.Input().Ref(), true);
+    if (!outItemType || !outItemType->IsPersistable()) {
+        return node;
+    }
+    if (!EnsurePersistableYsonTypes(node.Pos(), *outItemType, ctx, State_)) {
+        return {};
+    }
+
+    bool isOrdered = TCoPruneAdjacentKeys::Match(node.Raw());
+    auto pruneKeysCallable = isOrdered ? "PruneAdjacentKeys" : "PruneKeys";
+    YQL_CLOG(DEBUG, Core) << "Push " << pruneKeysCallable << " into YT Operation";
+    return BuildMapForPruneKeys(
+        node,
+        extractorLambda.Ptr(),
+        isOrdered,
+        *cluster,
+        GetWorld(op.Input(), {}, ctx).Ptr(),
+        ConvertInputTable(op.Input(), ctx),
+        outItemType,
+        ctx,
+        State_);
 }
 
 }  // namespace NYql

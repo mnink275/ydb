@@ -51,7 +51,6 @@ public:
     TEvPollerReady* InactivityEvent = nullptr;
 
     const TActorId ListenerActorId;
-    const TActorId KafkaTxnCoordinatorActorId = NKafka::MakeKafkaTransactionsServiceID();
 
     TIntrusivePtr<TSocketDescriptor> Socket;
     TSocketAddressType Address;
@@ -104,7 +103,7 @@ public:
 
     void Bootstrap() {
         Context->ConnectionId = SelfId();
-        Context->RequireAuthentication = NKikimr::AppData()->EnforceUserTokenRequirement;
+        Context->RequireAuthentication = NKikimr::AppData()->EnforceUserTokenRequirement || NKikimr::AppData()->PQConfig.GetRequireCredentialsInNewProtocol();
         // if no authentication required, then we can use local database as our target
         if (!Context->RequireAuthentication) {
             Context->DatabasePath = NKikimr::AppData()->TenantName;
@@ -296,6 +295,10 @@ protected:
         Register(CreateKafkaMetadataActor(Context, header->CorrelationId, message, NKafka::MakeKafkaDiscoveryCacheID()));
     }
 
+    void HandleMessage(TRequestHeaderData* header, const TMessagePtr<TDescribeConfigsRequestData>& message) {
+        Register(CreateKafkaDescribeConfigsActor(Context, header->CorrelationId, message));
+    }
+
     void HandleMessage(const TRequestHeaderData* header, const TMessagePtr<TSaslAuthenticateRequestData>& message) {
         Register(CreateKafkaSaslAuthActor(Context, header->CorrelationId, Address, message));
     }
@@ -334,6 +337,42 @@ protected:
 
     void HandleMessage(const TRequestHeaderData* header, const TMessagePtr<TAlterConfigsRequestData>& message) {
         Register(CreateKafkaAlterConfigsActor(Context, header->CorrelationId, message));
+    }
+
+    void HandleMessage(const TRequestHeaderData* header, const TMessagePtr<TAddPartitionsToTxnRequestData>& message) {
+        Send(MakeTransactionsServiceID(SelfId().NodeId()), new TEvKafka::TEvAddPartitionsToTxnRequest(
+            header->CorrelationId, 
+            message,
+            Context->ConnectionId,
+            Context->DatabasePath
+        ));
+    }
+
+    void HandleMessage(const TRequestHeaderData* header, const TMessagePtr<TAddOffsetsToTxnRequestData>& message) {
+        Send(MakeTransactionsServiceID(SelfId().NodeId()), new TEvKafka::TEvAddOffsetsToTxnRequest(
+            header->CorrelationId, 
+            message,
+            Context->ConnectionId,
+            Context->DatabasePath
+        ));
+    }
+
+    void HandleMessage(const TRequestHeaderData* header, const TMessagePtr<TTxnOffsetCommitRequestData>& message) {
+        Send(MakeTransactionsServiceID(SelfId().NodeId()), new TEvKafka::TEvTxnOffsetCommitRequest(
+            header->CorrelationId, 
+            message,
+            Context->ConnectionId,
+            Context->DatabasePath
+        ));
+    }
+
+    void HandleMessage(const TRequestHeaderData* header, const TMessagePtr<TEndTxnRequestData>& message) {
+        Send(MakeTransactionsServiceID(SelfId().NodeId()), new TEvKafka::TEvEndTxnRequest(
+            header->CorrelationId, 
+            message,
+            Context->ConnectionId,
+            Context->DatabasePath
+        ));
     }
 
     template<class T>
@@ -427,12 +466,32 @@ protected:
                 HandleMessage(&Request->Header, Cast<TCreateTopicsRequestData>(Request));
                 break;
 
+            case DESCRIBE_CONFIGS:
+                HandleMessage(&Request->Header, Cast<TDescribeConfigsRequestData>(Request));
+                break;
+
             case CREATE_PARTITIONS:
                 HandleMessage(&Request->Header, Cast<TCreatePartitionsRequestData>(Request));
                 break;
 
             case ALTER_CONFIGS:
                 HandleMessage(&Request->Header, Cast<TAlterConfigsRequestData>(Request));
+                break;
+
+            case ADD_PARTITIONS_TO_TXN:
+                HandleMessage(&Request->Header, Cast<TAddPartitionsToTxnRequestData>(Request));
+                break;
+
+            case ADD_OFFSETS_TO_TXN:
+                HandleMessage(&Request->Header, Cast<TAddOffsetsToTxnRequestData>(Request));
+                break;
+
+            case TXN_OFFSET_COMMIT:
+                HandleMessage(&Request->Header, Cast<TTxnOffsetCommitRequestData>(Request));
+                break;
+
+            case END_TXN:
+                HandleMessage(&Request->Header, Cast<TEndTxnRequestData>(Request));
                 break;
 
             default:
@@ -471,7 +530,7 @@ protected:
             return;
         }
 
-        Context->RequireAuthentication = NKikimr::AppData()->EnforceUserTokenRequirement;
+        Context->RequireAuthentication = NKikimr::AppData()->EnforceUserTokenRequirement || NKikimr::AppData()->PQConfig.GetRequireCredentialsInNewProtocol();
         Context->UserToken = event->UserToken;
         Context->DatabasePath = event->DatabasePath;
         Context->AuthenticationStep = authStep;
@@ -562,7 +621,10 @@ protected:
             responseHeader.Write(writable, headerVersion);
             reply->Write(writable, version);
 
-            Buffer.flush();
+            ssize_t res = Buffer.flush();
+            if (res < 0) {
+                ythrow yexception() << "Error during flush of the written to socket data. Error code: " << strerror(-res) << " (" << res << ")";
+            }
 
             KAFKA_LOG_D("Sent reply: ApiKey=" << header->RequestApiKey << ", Version=" << version << ", Correlation=" << responseHeader.CorrelationId <<  ", Size=" << size);
         } catch(const yexception& e) {

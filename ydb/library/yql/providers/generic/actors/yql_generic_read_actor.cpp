@@ -55,7 +55,7 @@ namespace NYql::NDq {
             , TokenProvider_(std::move(tokenProvider))
             , Partitions_(std::move(partitions))
             , HolderFactory_(holderFactory)
-            , Source_(source)
+            , Source_(std::move(source))
         {
             IngressStats_.Level = statsLevel;
         }
@@ -399,7 +399,10 @@ namespace NYql::NDq {
         if (!readRanges.empty()) {
             for (const auto& readRange : readRanges) {
                 Generic::TPartition partition;
-                YQL_ENSURE(partition.ParseFromString(readRange), "Failed to parse partition from read ranges");
+                YQL_ENSURE(
+                    partition.ParseFromString(readRange), 
+                    "Failed to parse partition from read ranges: " << partition.InitializationErrorString()
+                );
                 partitions.emplace_back(std::move(partition));
             }
         } else {
@@ -407,7 +410,10 @@ namespace NYql::NDq {
             if (iter != taskParams.end()) {
                 Generic::TPartition partition;
                 TStringInput input(iter->first);
-                YQL_ENSURE(partition.ParseFromString(iter->second), "Failed to parse partition from task params");
+                YQL_ENSURE(
+                    partition.ParseFromString(iter->second), 
+                    "Failed to parse partition from task params: " << partition.InitializationErrorString()
+                );
                 partitions.emplace_back(std::move(partition));
             }
         }

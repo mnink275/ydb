@@ -44,11 +44,12 @@ void TTxInternalScan::Complete(const TActorContext& ctx) {
 
     TScannerConstructorContext context(snapshot, 0, sorting);
     {
-        TReadDescription read(snapshot, sorting);
+        TReadDescription read(Self->TabletID(), snapshot, sorting);
         read.SetScanIdentifier(request.TaskIdentifier);
         read.PathId = request.GetPathId();
         read.LockId = LockId;
-        read.ReadNothing = !Self->TablesManager.HasTable(read.PathId);
+        read.ReadNothing = !Self->TablesManager.HasTable(read.PathId.InternalPathId);
+        read.DeduplicationPolicy = EDeduplicationPolicy::PREVENT_DUPLICATES;
         std::unique_ptr<IScannerConstructor> scannerConstructor(new NPlain::TIndexScannerConstructor(context));
         read.ColumnIds = request.GetColumnIds();
         if (request.RangesFilter) {
@@ -86,7 +87,7 @@ void TTxInternalScan::Complete(const TActorContext& ctx) {
     auto scanActorId = ctx.Register(new TColumnShardScan(Self->SelfId(), scanComputeActor, Self->GetStoragesManager(),
         Self->DataAccessorsManager.GetObjectPtrVerified(),
         TComputeShardingPolicy(), ScanId, LockId.value_or(0), ScanGen, requestCookie, Self->TabletID(), TDuration::Max(), readMetadataRange,
-        NKikimrDataEvents::FORMAT_ARROW, Self->Counters.GetScanCounters()));
+        NKikimrDataEvents::FORMAT_ARROW, Self->Counters.GetScanCounters(), {}));
 
     Self->InFlightReadsTracker.AddScanActorId(requestCookie, scanActorId);
     AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD_SCAN)("event", "TTxInternalScan started")("actor_id", scanActorId)("trace_detailed", detailedInfo);

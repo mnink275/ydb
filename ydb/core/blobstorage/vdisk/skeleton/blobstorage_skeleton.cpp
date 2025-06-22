@@ -99,6 +99,7 @@ namespace NKikimr {
             }
             ctx.Send(*SkeletonFrontIDPtr, ev.release());
             // send VDisk's metric to NodeWarden
+            const bool enableThrottlingReport = AppData()->FeatureFlags.GetEnableThrottlingReport();
             ctx.Send(NodeWardenServiceId,
                      new TEvBlobStorage::TEvControllerUpdateDiskStatus(
                          SelfVDiskId,
@@ -109,8 +110,8 @@ namespace NKikimr {
                          state,
                          replicated,
                          outOfSpaceFlags,
-                         OverloadHandler ? OverloadHandler->IsThrottling() : false,
-                         OverloadHandler ? OverloadHandler->GetThrottlingRate() : 0));
+                         enableThrottlingReport ? std::make_optional(OverloadHandler ? OverloadHandler->IsThrottling() : false) : std::nullopt,
+                         enableThrottlingReport ? std::make_optional(OverloadHandler ? OverloadHandler->GetThrottlingRate() : 0) : std::nullopt));
             // repeat later
             ctx.Schedule(Config->WhiteboardUpdateInterval, new TEvTimeToUpdateWhiteboard());
         }
@@ -2288,6 +2289,10 @@ namespace NKikimr {
                                     TABLED() {str << Config->BaseInfo.PDiskId;}
                                 }
                                 TABLER() {
+                                    TABLED() {str << "GroupSizeInUnits";}
+                                    TABLED() {str << Config->GroupSizeInUnits;}
+                                }
+                                TABLER() {
                                     TABLED() {str << "BlobStorage GroupId (decimal)";}
                                     TABLED() {str << GInfo->GroupID;}
                                 }
@@ -2421,6 +2426,17 @@ namespace NKikimr {
             GInfo = msg->NewInfo;
             SelfVDiskId = msg->NewVDiskId;
 
+            if (Config->GroupSizeInUnits != GInfo->GroupSizeInUnits) {
+                Config->GroupSizeInUnits = GInfo->GroupSizeInUnits;
+                UpdateWhiteboard(ctx);
+
+                ctx.Send(PDiskCtx->PDiskId,
+                    new NPDisk::TEvYardResize(
+                        PDiskCtx->Dsk->Owner,
+                        PDiskCtx->Dsk->OwnerRound,
+                        Config->GroupSizeInUnits));
+            }
+
             // clear VPatchCtx
             VPatchCtx = nullptr;
 
@@ -2486,6 +2502,9 @@ namespace NKikimr {
 
         void Handle(TEvents::TEvGone::TPtr &ev, const TActorContext &ctx) {
             Y_UNUSED(ctx);
+            if (ev->Sender == ShredActorId) {
+                ShredActorId = {};
+            }
             ActiveActors.Erase(ev->Sender);
         }
 
@@ -2806,6 +2825,7 @@ namespace NKikimr {
             CFunc(TEvBlobStorage::EvTimeToUpdateWhiteboard, UpdateWhiteboard)
             HFunc(NPDisk::TEvCutLog, Handle)
             HFunc(TEvVGenerationChange, Handle)
+            IgnoreFunc(NPDisk::TEvYardResizeResult)
             HFunc(TEvents::TEvPoisonPill, HandlePoison)
             HFunc(TEvents::TEvGone, Handle)
             CFunc(TEvBlobStorage::EvCommenceRepl, HandleCommenceRepl)
@@ -2858,6 +2878,7 @@ namespace NKikimr {
             HFunc(NPDisk::TEvCutLog, Handle)
             HFunc(NPDisk::TEvConfigureSchedulerResult, Handle)
             HFunc(TEvVGenerationChange, Handle)
+            IgnoreFunc(NPDisk::TEvYardResizeResult)
             HFunc(TEvents::TEvPoisonPill, HandlePoison)
             HFunc(TEvents::TEvGone, Handle)
             CFunc(TEvBlobStorage::EvCommenceRepl, HandleCommenceRepl)
@@ -2929,6 +2950,7 @@ namespace NKikimr {
             HFunc(NPDisk::TEvCutLog, Handle)
             HFunc(NPDisk::TEvConfigureSchedulerResult, Handle)
             HFunc(TEvVGenerationChange, Handle)
+            IgnoreFunc(NPDisk::TEvYardResizeResult)
             HFunc(TEvents::TEvPoisonPill, HandlePoison)
             HFunc(TEvents::TEvGone, Handle)
             fFunc(TEvBlobStorage::EvReplDone, HandleReplDone)
@@ -2960,6 +2982,7 @@ namespace NKikimr {
             HFunc(TEvents::TEvPoisonPill, HandlePoison)
             HFunc(TEvents::TEvGone, Handle)
             HFunc(TEvVGenerationChange, Handle)
+            IgnoreFunc(NPDisk::TEvYardResizeResult)
             CFunc(TEvBlobStorage::EvReplDone, Ignore)
             CFunc(TEvBlobStorage::EvCommenceRepl, HandleCommenceRepl)
             fFunc(TEvBlobStorage::EvControllerScrubStartQuantum, ForwardToScrubActor)

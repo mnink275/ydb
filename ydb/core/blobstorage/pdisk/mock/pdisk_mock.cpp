@@ -3,6 +3,7 @@
 #include <ydb/core/util/stlog.h>
 #include <ydb/core/util/interval_set.h>
 
+#include <ydb/core/blobstorage/pdisk/blobstorage_pdisk_quota_record.h>
 #include <ydb/core/blobstorage/pdisk/blobstorage_pdisk_util_space_color.h>
 
 namespace NKikimr {
@@ -29,6 +30,7 @@ struct TPDiskMockState::TImpl {
         ui64 LogDataSize = 0;
         bool Slain = false;
         ui64 LastLsn = 0;
+        ui32 GroupSizeInUnits = 0;
     };
 
     const ui32 NodeId;
@@ -50,7 +52,12 @@ struct TPDiskMockState::TImpl {
     NPDisk::EDeviceType DeviceType;
     std::optional<TRcBuf> Metadata;
 
-    TImpl(ui32 nodeId, ui32 pdiskId, ui64 pdiskGuid, ui64 size, ui32 chunkSize, bool isDiskReadOnly, NPDisk::EDeviceType deviceType)
+    ESpaceColorPolicy SpaceColorPolicy;
+    std::shared_ptr<NPDisk::TQuotaRecord> ChunkSharedQuota;
+    double Occupancy = 0;
+
+    TImpl(ui32 nodeId, ui32 pdiskId, ui64 pdiskGuid, ui64 size, ui32 chunkSize, bool isDiskReadOnly, NPDisk::EDeviceType deviceType,
+            ESpaceColorPolicy spaceColorPolicy)
         : NodeId(nodeId)
         , PDiskId(pdiskId)
         , PDiskGuid(pdiskGuid)
@@ -62,7 +69,20 @@ struct TPDiskMockState::TImpl {
         , NextFreeChunk(1)
         , StatusFlags(NPDisk::TStatusFlags{})
         , DeviceType(deviceType)
-    {}
+        , SpaceColorPolicy(spaceColorPolicy)
+    {
+        switch (SpaceColorPolicy) {
+            case ESpaceColorPolicy::SharedQuota: {
+                ChunkSharedQuota = std::make_shared<NPDisk::TQuotaRecord>();
+                // 13% for CYAN is default value in prod
+                ChunkSharedQuota->ForceHardLimit(TotalChunks, NPDisk::TColorLimits::MakeChunkLimits(130));
+                break;
+            }
+            case ESpaceColorPolicy::None:
+            default:
+                break;
+        }
+    }
 
     TImpl(const TImpl&) = default;
 
@@ -73,6 +93,28 @@ struct TPDiskMockState::TImpl {
     void AdjustFreeChunks() {
         for (auto it = FreeChunks.end(); it != FreeChunks.begin() && *--it == NextFreeChunk - 1; it = FreeChunks.erase(it)) {
             --NextFreeChunk;
+        }
+    }
+
+    void UpdateStatusFlags() {
+        switch (SpaceColorPolicy) {
+            case ESpaceColorPolicy::SharedQuota: {
+                i64 before = ChunkSharedQuota->GetFree();
+                i64 now = GetNumFreeChunks();
+                if (before < now) {
+                    ChunkSharedQuota->Release(now - before);
+                } else if (before > now) {
+                    ChunkSharedQuota->ForceAllocate(before - now);
+                }
+
+                NKikimrBlobStorage::TPDiskSpaceColor::E newColor =
+                        ChunkSharedQuota->EstimateSpaceColor(0, &Occupancy);
+                SetStatusFlags(SpaceColorToStatusFlag(newColor));
+                break;
+            }
+            case ESpaceColorPolicy::None:
+            default:
+                break;
         }
     }
 
@@ -88,7 +130,8 @@ struct TPDiskMockState::TImpl {
             to.ReservedChunks.insert(FreeChunks.extract(it));
         }
 
-        Y_VERIFY(chunkIdx != TotalChunks);
+        Y_ABORT_UNLESS(chunkIdx != TotalChunks);
+
         return chunkIdx;
     }
 
@@ -172,6 +215,7 @@ struct TPDiskMockState::TImpl {
         for (const TChunkIdx chunkIdx : owner.ReservedChunks) {
             owner.ChunkData.erase(chunkIdx);
         }
+
         FreeChunks.merge(owner.ReservedChunks);
         AdjustFreeChunks();
     }
@@ -188,7 +232,8 @@ struct TPDiskMockState::TImpl {
         Y_VERIFY(num);
         owner.ChunkData.erase(chunkIdx);
         const bool inserted = FreeChunks.insert(chunkIdx).second;
-        Y_VERIFY(inserted);
+        Y_ABORT_UNLESS(inserted);
+
         AdjustFreeChunks();
     }
 
@@ -286,8 +331,9 @@ struct TPDiskMockState::TImpl {
 };
 
 TPDiskMockState::TPDiskMockState(ui32 nodeId, ui32 pdiskId, ui64 pdiskGuid, ui64 size, ui32 chunkSize, bool isDiskReadOnly,
-        NPDisk::EDeviceType deviceType)
-    : TPDiskMockState(std::make_unique<TImpl>(nodeId, pdiskId, pdiskGuid, size, chunkSize, isDiskReadOnly, deviceType))
+        NPDisk::EDeviceType deviceType, ESpaceColorPolicy spaceColorPolicy)
+    : TPDiskMockState(std::make_unique<TImpl>(nodeId, pdiskId, pdiskGuid, size, chunkSize, isDiskReadOnly, deviceType,
+            spaceColorPolicy))
 {}
 
 TPDiskMockState::TPDiskMockState(std::unique_ptr<TImpl>&& impl)
@@ -339,6 +385,17 @@ bool TPDiskMockState::IsDiskReadOnly() const {
 
 TString& TPDiskMockState::GetStateErrorReason() {
     return Impl->StateErrorReason;
+}
+
+ui32 TPDiskMockState::GetNumActiveSlots() const {
+    size_t sum = 0;
+    for (auto& [ownerId, owner] : Impl->Owners) {
+        // NOTE: the value is hardcoded intentionally.
+        // It's one of the limitations of pdisk mock
+        const ui32 slotSizeInUnits = 1u;
+        sum += TPDiskConfig::GetOwnerWeight(owner.GroupSizeInUnits, slotSizeInUnits);
+    }
+    return sum;
 }
 
 TPDiskMockState::TPtr TPDiskMockState::Snapshot() {
@@ -419,6 +476,7 @@ public:
             owner->OwnerRound = ev->Get()->OwnerRound;
             owner->CutLogId = ev->Get()->CutLogID;
             owner->Slain = false;
+            owner->GroupSizeInUnits = ev->Get()->GroupSizeInUnits;
 
             // drop data from any reserved chunks and return them to free pool
             Impl.ResetOwnerReservedChunks(*owner);
@@ -444,6 +502,17 @@ public:
         Send(ev->Sender, res.release());
     }
 
+    void Handle(NPDisk::TEvYardResize::TPtr ev) {
+        auto *msg = ev->Get();
+        PDISK_MOCK_LOG(NOTICE, PDM03, "received TEvYardResize", (Msg, msg->ToString()));
+
+        auto res = std::make_unique<NPDisk::TEvYardResizeResult>(NKikimrProto::OK, GetStatusFlags(), TString());
+        if (TImpl::TOwner *owner = Impl.FindOwner(msg, res)) {
+            owner->GroupSizeInUnits = msg->GroupSizeInUnits;
+        }
+        Send(ev->Sender, res.release());
+    }
+
     void Handle(NPDisk::TEvSlay::TPtr ev) {
         auto *msg = ev->Get();
         PDISK_MOCK_LOG(INFO, PDM17, "received TEvSlay", (Msg, msg->ToString()));
@@ -457,7 +526,7 @@ public:
             Send(ev->Sender, res.release());
             return;
         }
-        
+
         bool found = false;
         for (auto& [ownerId, owner] : Impl.Owners) {
             if (!owner.VDiskId.SameExceptGeneration(msg->VDiskId)) {
@@ -670,12 +739,14 @@ public:
             if (Impl.GetNumFreeChunks() < msg->SizeChunks) {
                 PDISK_MOCK_LOG(NOTICE, PDM09, "received TEvChunkReserve", (Msg, msg->ToString()), (Error, "no free chunks"));
                 res->Status = NKikimrProto::OUT_OF_SPACE;
+                res->StatusFlags = GetStatusFlags() | ui32(NKikimrBlobStorage::StatusNotEnoughDiskSpaceForOperation);
                 res->ErrorReason = "no free chunks";
             } else {
                 PDISK_MOCK_LOG(DEBUG, PDM07, "received TEvChunkReserve", (Msg, msg->ToString()), (VDiskId, owner->VDiskId));
                 for (ui32 i = 0; i < msg->SizeChunks; ++i) {
                     res->ChunkIds.push_back(Impl.AllocateChunk(*owner));
                 }
+                res->StatusFlags = GetStatusFlags();
                 PDISK_MOCK_LOG(DEBUG, PDM10, "sending TEvChunkReserveResult", (Msg, res->ToString()));
             }
         }
@@ -742,9 +813,11 @@ public:
             if (!msg->ChunkIdx) { // allocate chunk
                 if (!Impl.GetNumFreeChunks()) {
                     res->Status = NKikimrProto::OUT_OF_SPACE;
+                    res->StatusFlags = GetStatusFlags() | ui32(NKikimrBlobStorage::StatusNotEnoughDiskSpaceForOperation);
                     res->ErrorReason = "no free chunks";
                 } else {
                     msg->ChunkIdx = res->ChunkIdx = Impl.AllocateChunk(*owner);
+                    res->StatusFlags = GetStatusFlags();
                 }
             }
             if (msg->ChunkIdx) {
@@ -847,8 +920,8 @@ public:
         auto *msg = ev->Get();
         auto res = std::make_unique<NPDisk::TEvCheckSpaceResult>(NKikimrProto::OK, GetStatusFlags(),
             Impl.GetNumFreeChunks(), Impl.TotalChunks, Impl.TotalChunks - Impl.GetNumFreeChunks(),
-            Impl.Owners.size(), TString());
-        res->Occupancy = (double)res->UsedChunks / res->TotalChunks;
+            Impl.Owners.size(), 0u, TString());
+        res->Occupancy = GetOccupancy();
         Impl.FindOwner(msg, res); // to ensure correct owner/round
         Send(ev->Sender, res.release());
     }
@@ -883,15 +956,26 @@ public:
     }
 
     NPDisk::TStatusFlags GetStatusFlags() {
+        Impl.UpdateStatusFlags();
         return Impl.StatusFlags;
+    }
+
+    double GetOccupancy() {
+        return (Impl.Occupancy == 0)
+            ? ((double)(Impl.TotalChunks - Impl.GetNumFreeChunks()) / Impl.TotalChunks)
+            : Impl.Occupancy;
     }
 
     void ErrorHandle(NPDisk::TEvYardInit::TPtr &ev) {
         Send(ev->Sender, new NPDisk::TEvYardInitResult(NKikimrProto::CORRUPTED, State->GetStateErrorReason()));
     }
 
+    void ErrorHandle(NPDisk::TEvYardResize::TPtr &ev) {
+        Send(ev->Sender, new NPDisk::TEvYardResizeResult(NKikimrProto::CORRUPTED, 0, State->GetStateErrorReason()));
+    }
+
     void ErrorHandle(NPDisk::TEvCheckSpace::TPtr &ev) {
-        Send(ev->Sender, new NPDisk::TEvCheckSpaceResult(NKikimrProto::CORRUPTED, 0, 0, 0, 0, 0, State->GetStateErrorReason()));
+        Send(ev->Sender, new NPDisk::TEvCheckSpaceResult(NKikimrProto::CORRUPTED, 0, 0, 0, 0, 0, 0u, State->GetStateErrorReason()));
     }
 
     void ErrorHandle(NPDisk::TEvLog::TPtr &ev) {
@@ -993,6 +1077,7 @@ public:
 
     STRICT_STFUNC(StateNormal,
         hFunc(NPDisk::TEvYardInit, Handle);
+        hFunc(NPDisk::TEvYardResize, Handle);
         hFunc(NPDisk::TEvLog, Handle);
         hFunc(NPDisk::TEvChunkForget, Handle);
         hFunc(NPDisk::TEvMultiLog, Handle);
@@ -1018,6 +1103,7 @@ public:
 
     STRICT_STFUNC(StateError,
         hFunc(NPDisk::TEvYardInit, ErrorHandle);
+        hFunc(NPDisk::TEvYardResize, ErrorHandle);
         hFunc(NPDisk::TEvCheckSpace, ErrorHandle);
         hFunc(NPDisk::TEvLog, ErrorHandle);
         hFunc(NPDisk::TEvMultiLog, ErrorHandle);

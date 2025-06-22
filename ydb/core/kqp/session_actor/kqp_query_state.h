@@ -336,6 +336,10 @@ public:
         return RequestEv->GetTopicOperations();
     }
 
+    const ::NKikimrKqp::TKafkaApiOperationsRequest& GetKafkaApiOperationsFromRequest() const {
+        return RequestEv->GetKafkaApiOperations();
+    }
+
     bool NeedPersistentSnapshot() const {
         auto type = GetType();
         return (
@@ -432,14 +436,14 @@ public:
         return true;
     }
 
-    TKqpPhyTxHolder::TConstPtr GetCurrentPhyTx(bool isBatchQuery = false) {
+    TKqpPhyTxHolder::TConstPtr GetCurrentPhyTx(bool isBatchQuery, NMiniKQL::TTypeEnvironment& txTypeEnv) {
         const auto& phyQuery = PreparedQuery->GetPhysicalQuery();
         auto tx = PreparedQuery->GetPhyTxOrEmpty(CurrentTx);
 
         if (TxCtx->CanDeferEffects() && !isBatchQuery) {
             // Olap sinks require separate tnx with commit.
             while (tx && tx->GetHasEffects() && !TxCtx->HasOlapTable) {
-                QueryData->CreateKqpValueMap(tx);
+                QueryData->PrepareParameters(tx, PreparedQuery, txTypeEnv);
                 bool success = TxCtx->AddDeferredEffect(tx, QueryData);
                 YQL_ENSURE(success);
                 if (CurrentTx + 1 < phyQuery.TransactionsSize()) {
@@ -582,7 +586,7 @@ public:
     }
 
     //// Topic ops ////
-    void AddOffsetsToTransaction();
+    void FillTopicOperations();
     bool TryMergeTopicOffsets(const NTopic::TTopicOperations &operations, TString& message);
     std::unique_ptr<NSchemeCache::TSchemeCacheNavigate> BuildSchemeCacheNavigate();
     bool IsAccessDenied(const NSchemeCache::TSchemeCacheNavigate& response, TString& message);

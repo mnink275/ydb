@@ -475,6 +475,12 @@ public:
                 break;
             }
 
+            case NKqpProto::TKqpSchemeOperation::kAlterDatabase: {
+                const auto& modifyScheme = schemeOp.GetAlterDatabase();
+                ev->Record.MutableTransaction()->MutableModifyScheme()->CopyFrom(modifyScheme);
+                break;
+            }
+
             default:
                 InternalError(TStringBuilder() << "Unexpected scheme operation: "
                     << (ui32) schemeOp.GetOperationCase());
@@ -697,6 +703,9 @@ public:
         const auto& buildOp = schemeOp.GetBuildOperation();
         SetSchemeShardId(domainInfo->ExtractSchemeShard());
         auto req = std::make_unique<NSchemeShard::TEvIndexBuilder::TEvCreateRequest>(TxId, Database, buildOp);
+        if (UserToken) {
+            req->Record.SetUserSID(UserToken->GetUserSID());
+        }
         ForwardToSchemeShard(std::move(req));
     }
 

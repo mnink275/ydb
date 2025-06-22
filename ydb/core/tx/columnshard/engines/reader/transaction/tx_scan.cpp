@@ -54,23 +54,28 @@ void TTxScan::Complete(const TActorContext& ctx) {
     const TString table = request.GetTablePath();
     const auto dataFormat = request.GetDataFormat();
     const TDuration timeout = TDuration::MilliSeconds(request.GetTimeoutMs());
+    NConveyorComposite::TCPULimitsConfig cpuLimits;
+    cpuLimits.DeserializeFromProto(request).Validate();
     if (scanGen > 1) {
         Self->Counters.GetTabletCounters()->IncCounter(NColumnShard::COUNTER_SCAN_RESTARTED);
     }
     const NActors::TLogContextGuard gLogging = NActors::TLogContextBuilder::Build() ("tx_id", txId)("scan_id", scanId)("gen", scanGen)(
-        "table", table)("snapshot", snapshot)("tablet", Self->TabletID())("timeout", timeout);
+        "table", table)("snapshot", snapshot)("tablet", Self->TabletID())("timeout", timeout)("cpu_limits", cpuLimits.DebugString());
 
     TReadMetadataPtr readMetadataRange;
     {
         LOG_S_DEBUG("TTxScan prepare txId: " << txId << " scanId: " << scanId << " at tablet " << Self->TabletID());
 
-        TReadDescription read(snapshot, sorting);
+        TReadDescription read(Self->TabletID(), snapshot, sorting);
         read.TxId = txId;
         if (request.HasLockTxId()) {
             read.LockId = request.GetLockTxId();
         }
-        read.PathId = TInternalPathId::FromRawValue(request.GetLocalPathId());
-        read.ReadNothing = !Self->TablesManager.HasTable(read.PathId);
+
+        const auto& schemeShardLocalPathId = NColumnShard::TSchemeShardLocalPathId::FromProto(request);
+        const auto& internalPathId = Self->TablesManager.ResolveInternalPathId(schemeShardLocalPathId);
+        read.PathId = NColumnShard::TUnifiedPathId{internalPathId ? *internalPathId : TInternalPathId{}, schemeShardLocalPathId};
+        read.ReadNothing = !Self->TablesManager.HasTable(read.PathId.InternalPathId);
         read.TableName = table;
 
         const TString defaultReader =
@@ -160,7 +165,8 @@ void TTxScan::Complete(const TActorContext& ctx) {
 
     auto scanActorId = ctx.Register(new TColumnShardScan(Self->SelfId(), scanComputeActor, Self->GetStoragesManager(),
         Self->DataAccessorsManager.GetObjectPtrVerified(), shardingPolicy, scanId,
-        txId, scanGen, requestCookie, Self->TabletID(), timeout, readMetadataRange, dataFormat, Self->Counters.GetScanCounters()));
+        txId, scanGen, requestCookie, Self->TabletID(), timeout, readMetadataRange, dataFormat, Self->Counters.GetScanCounters(),
+        cpuLimits));
     Self->InFlightReadsTracker.AddScanActorId(requestCookie, scanActorId);
 
     AFL_DEBUG(NKikimrServices::TX_COLUMNSHARD_SCAN)("event", "TTxScan started")("actor_id", scanActorId)("trace_detailed", detailedInfo);

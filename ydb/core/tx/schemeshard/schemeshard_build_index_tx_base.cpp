@@ -23,6 +23,11 @@ void TSchemeShard::TIndexBuilder::TTxBase::ApplyState(NTabletFlatExecutor::TTran
         Y_VERIFY_S(buildInfoPtr, "IndexBuilds has no " << buildId);
         auto& buildInfo = *buildInfoPtr->Get();
         LOG_I("Change state from " << buildInfo.State << " to " << state);
+        if (state == TIndexBuildInfo::EState::Rejected ||
+            state == TIndexBuildInfo::EState::Cancelled ||
+            state == TIndexBuildInfo::EState::Done) {
+            buildInfo.EndTime = TAppData::TimeProvider->Now();
+        }
         buildInfo.State = state;
 
         NIceDb::TNiceDb db(txc.DB);
@@ -49,11 +54,6 @@ void TSchemeShard::TIndexBuilder::TTxBase::ApplySchedule(const TActorContext& ct
                 ui64(std::get<0>(rec)),
                 ctx.Now()));
     }
-}
-
-ui64 TSchemeShard::TIndexBuilder::TTxBase::RequestUnits(const TBillingStats& stats) {
-    return TRUCalculator::ReadTable(stats.GetReadBytes())
-         + TRUCalculator::BulkUpsert(stats.GetUploadBytes(), stats.GetUploadRows());
 }
 
 void TSchemeShard::TIndexBuilder::TTxBase::RoundPeriod(TInstant& start, TInstant& end) {
@@ -118,7 +118,7 @@ void TSchemeShard::TIndexBuilder::TTxBase::ApplyBill(NTabletFlatExecutor::TTrans
         }
 
         if (!cloud_id || !folder_id || !database_id) {
-            LOG_N("ApplyBill: unable to make a bill, neither cloud_id and nor folder_id nor database_id have found in user attributes at the domain"
+            LOG_I("ApplyBill: unable to make a bill, neither cloud_id and nor folder_id nor database_id have found in user attributes at the domain"
                   << ", build index operation: " << buildId
                   << ", domain: " << domain.PathString()
                   << ", domainId: " << buildInfo.DomainPathId
@@ -128,7 +128,7 @@ void TSchemeShard::TIndexBuilder::TTxBase::ApplyBill(NTabletFlatExecutor::TTrans
         }
 
         if (!Self->IsServerlessDomain(domain)) {
-            LOG_N("ApplyBill: unable to make a bill, domain is not a serverless db"
+            LOG_I("ApplyBill: unable to make a bill, domain is not a serverless db"
                   << ", build index operation: " << buildId
                   << ", domain: " << domain.PathString()
                   << ", domainId: " << buildInfo.DomainPathId
@@ -152,7 +152,7 @@ void TSchemeShard::TIndexBuilder::TTxBase::ApplyBill(NTabletFlatExecutor::TTrans
         billed += toBill;
         Self->PersistBuildIndexBilled(db, buildInfo);
 
-        ui64 requestUnits = RequestUnits(toBill);
+        ui64 requestUnits = TRUCalculator::Calculate(toBill);
 
         const TString billRecord = TBillRecord()
             .Id(id)
@@ -177,6 +177,11 @@ void TSchemeShard::TIndexBuilder::TTxBase::Send(TActorId dst, THolder<IEventBase
     SideEffects.Send(dst, message.Release(), cookie, flags);
 }
 
+void TSchemeShard::TIndexBuilder::TTxBase::AllocateTxId(TIndexBuildId buildId) {
+    LOG_D("AllocateTxId " << buildId);
+    Send(Self->TxAllocatorClient, MakeHolder<TEvTxAllocatorClient::TEvAllocate>(), 0, ui64(buildId));
+}
+
 void TSchemeShard::TIndexBuilder::TTxBase::ChangeState(TIndexBuildId id, TIndexBuildInfo::EState state) {
     StateChanges.push_back(TChangeStateRec(id, state));
 }
@@ -187,8 +192,17 @@ void TSchemeShard::TIndexBuilder::TTxBase::Progress(TIndexBuildId id) {
 
 void TSchemeShard::TIndexBuilder::TTxBase::Fill(NKikimrIndexBuilder::TIndexBuild& index, const TIndexBuildInfo& indexInfo) {
     index.SetId(ui64(indexInfo.Id));
-    if (indexInfo.Issue) {
-        AddIssue(index.MutableIssues(), indexInfo.Issue);
+    if (indexInfo.GetIssue()) {
+        AddIssue(index.MutableIssues(), indexInfo.GetIssue());
+    }
+    if (indexInfo.StartTime != TInstant::Zero()) {
+        *index.MutableStartTime() = SecondsToProtoTimeStamp(indexInfo.StartTime.Seconds());
+    }
+    if (indexInfo.EndTime != TInstant::Zero()) {
+        *index.MutableEndTime() = SecondsToProtoTimeStamp(indexInfo.EndTime.Seconds());
+    }
+    if (indexInfo.UserSID) {
+        index.SetUserSID(*indexInfo.UserSID);
     }
 
     for (const auto& item: indexInfo.Shards) {
@@ -215,6 +229,7 @@ void TSchemeShard::TIndexBuilder::TTxBase::Fill(NKikimrIndexBuilder::TIndexBuild
     case TIndexBuildInfo::EState::Filling:
     case TIndexBuildInfo::EState::DropBuild:
     case TIndexBuildInfo::EState::CreateBuild:
+    case TIndexBuildInfo::EState::LockBuild:
         index.SetState(Ydb::Table::IndexBuildState::STATE_TRANSFERING_DATA);
         index.SetProgress(indexInfo.CalcProgressPercent());
         break;
@@ -408,12 +423,47 @@ bool TSchemeShard::TIndexBuilder::TTxBase::GotScheduledBilling(TIndexBuildInfo& 
 }
 
 bool TSchemeShard::TIndexBuilder::TTxBase::Execute(TTransactionContext& txc, const TActorContext& ctx) {
-    if (!DoExecute(txc, ctx)) {
+    bool executeResult;
+
+    try {
+        executeResult = DoExecute(txc, ctx);
+    } catch (const std::exception& exc) {
+        if (OnUnhandledExceptionSafe(txc, ctx, exc)) {
+            return true;
+        }
+        throw; // fail process, a really bad thing has happened
+    }
+
+    if (!executeResult) {
         return false;
     }
 
     ApplyOnExecute(txc, ctx);
     return true;
+}
+
+bool TSchemeShard::TIndexBuilder::TTxBase::OnUnhandledExceptionSafe(TTransactionContext& txc, const TActorContext& ctx, const std::exception& originalExc) {
+    try {
+        const auto* buildInfoPtr = Self->IndexBuilds.FindPtr(BuildId);
+        TIndexBuildInfo* buildInfo = buildInfoPtr
+            ? buildInfoPtr->Get()
+            : nullptr;
+
+        LOG_E("Unhandled exception, id#"
+            << (BuildId == InvalidIndexBuildId ? TString("<no id>") : TStringBuilder() << BuildId)
+            << " " << TypeName(originalExc) << ": " << originalExc.what() << Endl
+            << TBackTrace::FromCurrentException().PrintToString()
+            << ", TIndexBuildInfo: " << (buildInfo ? TStringBuilder() << (*buildInfo) : TString("<no build info>")));
+
+        OnUnhandledException(txc, ctx, buildInfo, originalExc);
+
+        return true;
+    } catch (const std::exception& handleExc) {
+        LOG_E("OnUnhandledException throws unhandled exception " 
+            << TypeName(handleExc) << ": " << handleExc.what() << Endl
+            << TBackTrace::FromCurrentException().PrintToString());
+        return false;
+    }
 }
 
 void TSchemeShard::TIndexBuilder::TTxBase::Complete(const TActorContext& ctx) {

@@ -30,6 +30,7 @@
 #include <ydb/core/kqp/compute_actor/kqp_compute_actor.h>
 #include <ydb/core/mon/mon.h>
 #include <ydb/library/ydb_issue/issue_helpers.h>
+#include <ydb/core/protos/workload_manager_config.pb.h>
 #include <ydb/core/sys_view/common/schema.h>
 
 #include <ydb/library/yql/utils/actor_log/log.h>
@@ -202,6 +203,7 @@ public:
         , TableServiceConfig(tableServiceConfig)
         , QueryServiceConfig(queryServiceConfig)
         , FeatureFlags()
+        , WorkloadManagerConfig()
         , KqpSettings(std::make_shared<const TKqpSettings>(std::move(settings)))
         , FederatedQuerySetupFactory(federatedQuerySetupFactory)
         , QueryReplayFactory(std::move(queryReplayFactory))
@@ -216,12 +218,16 @@ public:
         NLwTraceMonPage::ProbeRegistry().AddProbesList(LWTRACE_GET_PROBES(KQP_PROVIDER));
         Counters = MakeIntrusive<TKqpCounters>(AppData()->Counters, &TlsActivationContext->AsActorContext());
         FeatureFlags = AppData()->FeatureFlags;
+        WorkloadManagerConfig = AppData()->WorkloadManagerConfig;
         // NOTE: some important actors are constructed within next call
         FederatedQuerySetup = FederatedQuerySetupFactory->Make(ctx.ActorSystem());
         AsyncIoFactory = CreateKqpAsyncIoFactory(Counters, FederatedQuerySetup, S3ActorsFactory);
         ModuleResolverState = MakeIntrusive<TModuleResolverState>();
 
         LocalSessions = std::make_unique<TLocalSessionsRegistry>(AppData()->RandomProvider);
+        ExecuterConfig = MakeIntrusive<TExecuterMutableConfig>();
+        ExecuterConfig->ApplyFromTableServiceConfig(TableServiceConfig);
+
         RandomProvider = AppData()->RandomProvider;
         if (!GetYqlDefaultModuleResolver(ModuleResolverState->ExprCtx, ModuleResolverState->ModuleResolver)) {
             TStringStream errorStream;
@@ -240,13 +246,15 @@ public:
         ui32 tableServiceConfigKind = (ui32)NKikimrConsole::TConfigItem::TableServiceConfigItem;
         ui32 logConfigKind = (ui32)NKikimrConsole::TConfigItem::LogConfigItem;
         ui32 featureFlagsKind = (ui32)NKikimrConsole::TConfigItem::FeatureFlagsItem;
+        ui32 workloadManagerKind = (ui32)NKikimrConsole::TConfigItem::WorkloadManagerConfigItem;
+        ui32 queryServiceConfigKind = (ui32)NKikimrConsole::TConfigItem::QueryServiceConfigItem;
         Send(NConsole::MakeConfigsDispatcherID(SelfId().NodeId()),
             new NConsole::TEvConfigsDispatcher::TEvSetConfigSubscriptionRequest(
-                {tableServiceConfigKind, logConfigKind, featureFlagsKind}),
+                {tableServiceConfigKind, logConfigKind, featureFlagsKind, workloadManagerKind, queryServiceConfigKind}),
             IEventHandle::FlagTrackDelivery);
 
         WhiteBoardService = NNodeWhiteboard::MakeNodeWhiteboardServiceId(SelfId().NodeId());
-        ResourcePoolsCache.UpdateFeatureFlags(FeatureFlags, ActorContext());
+        ResourcePoolsCache.UpdateConfig(FeatureFlags, WorkloadManagerConfig, ActorContext());
 
         if (auto& cfg = TableServiceConfig.GetSpillingServiceConfig().GetLocalFileConfig(); cfg.GetEnable()) {
             TString spillingRoot = cfg.GetRoot();
@@ -292,9 +300,11 @@ public:
                 MakeKqpCompileComputationPatternServiceID(SelfId().NodeId()), CompileComputationPatternService);
         }
 
+        auto scheduler = std::make_shared<NScheduler::TComputeScheduler>(Counters);
+
         ResourceManager_ = GetKqpResourceManager();
         CaFactory_ = NComputeActor::MakeKqpCaFactory(
-            TableServiceConfig.GetResourceManager(), ResourceManager_, AsyncIoFactory, FederatedQuerySetup);
+            TableServiceConfig.GetResourceManager(), ResourceManager_, AsyncIoFactory, scheduler->CreateSchedulableTaskFactory(), FederatedQuerySetup);
 
         KqpNodeService = TActivationContext::Register(CreateKqpNodeService(TableServiceConfig, ResourceManager_, CaFactory_, Counters, AsyncIoFactory, FederatedQuerySetup));
         TActivationContext::ActorSystem()->RegisterLocalService(
@@ -303,6 +313,13 @@ public:
         KqpWorkloadService = TActivationContext::Register(CreateKqpWorkloadService(Counters->GetWorkloadManagerCounters()));
         TActivationContext::ActorSystem()->RegisterLocalService(
             MakeKqpWorkloadServiceId(SelfId().NodeId()), KqpWorkloadService);
+
+        NScheduler::TOptions schedulerOptions {
+            .UpdateFairSharePeriod = TDuration::MicroSeconds(500'000),
+        };
+        auto kqpSchedulerService = TActivationContext::Register(CreateKqpComputeSchedulerService(scheduler, schedulerOptions));
+        TActivationContext::ActorSystem()->RegisterLocalService(
+            MakeKqpSchedulerServiceId(SelfId().NodeId()), kqpSchedulerService);
 
         NActors::TMon* mon = AppData()->Mon;
         if (mon) {
@@ -513,11 +530,18 @@ public:
         TableServiceConfig.Swap(event.MutableConfig()->MutableTableServiceConfig());
         KQP_PROXY_LOG_D("Updated table service config.");
 
+        ExecuterConfig->ApplyFromTableServiceConfig(TableServiceConfig);
+
         LogConfig.Swap(event.MutableConfig()->MutableLogConfig());
         UpdateYqlLogLevels();
 
         FeatureFlags.Swap(event.MutableConfig()->MutableFeatureFlags());
-        ResourcePoolsCache.UpdateFeatureFlags(FeatureFlags, ActorContext());
+        WorkloadManagerConfig.Swap(event.MutableConfig()->MutableWorkloadManagerConfig());
+        ResourcePoolsCache.UpdateConfig(FeatureFlags, WorkloadManagerConfig, ActorContext());
+
+        if (event.GetConfig().HasQueryServiceConfig()) {
+            QueryServiceConfig.Swap(event.MutableConfig()->MutableQueryServiceConfig());
+        }
 
         auto responseEv = MakeHolder<NConsole::TEvConsole::TEvConfigNotificationResponse>(event);
         Send(ev->Sender, responseEv.Release(), IEventHandle::FlagTrackDelivery, ev->Cookie);
@@ -655,6 +679,13 @@ public:
         if (!DatabasesCache.SetDatabaseIdOrDefer(ev, static_cast<i32>(EDelayedRequestType::QueryRequest), ActorContext())) {
             return;
         }
+
+#if defined(USE_HDRF_SCHEDULER)
+        // TODO: not the best place for adding database.
+        auto addDatabaseEvent = MakeHolder<NScheduler::TEvAddDatabase>();
+        addDatabaseEvent->Id = ev->Get()->GetDatabaseId();
+        Send(MakeKqpSchedulerServiceId(SelfId().NodeId()), addDatabaseEvent.Release());
+#endif
 
         const TString& database = ev->Get()->GetDatabase();
         const TString& traceId = ev->Get()->GetTraceId();
@@ -1505,7 +1536,7 @@ private:
 
         auto dbCounters = Counters->GetDbCounters(database);
 
-        TKqpWorkerSettings workerSettings(cluster, database, clientApplicationName, clientUserName, TableServiceConfig, QueryServiceConfig, dbCounters);
+        TKqpWorkerSettings workerSettings(cluster, database, clientApplicationName, clientUserName, ExecuterConfig, TableServiceConfig, QueryServiceConfig, dbCounters);
         workerSettings.LongSession = longSession;
 
         auto config = CreateConfig(KqpSettings, workerSettings);
@@ -1598,10 +1629,10 @@ private:
     }
 
     bool TryFillPoolInfoFromCache(TEvKqp::TEvQueryRequest::TPtr& ev, ui64 requestId) {
-        ResourcePoolsCache.UpdateFeatureFlags(FeatureFlags, ActorContext());
+        ResourcePoolsCache.UpdateConfig(FeatureFlags, WorkloadManagerConfig, ActorContext());
 
         const auto& databaseId = ev->Get()->GetDatabaseId();
-        if (!ResourcePoolsCache.ResourcePoolsEnabled(databaseId)) {
+        if (!ResourcePoolsCache.ResourcePoolsEnabled(databaseId) || (ev->Get()->IsInternalCall() && WorkloadManagerConfig.GetEnabled())) {
             ev->Get()->SetPoolId("");
             return true;
         }
@@ -1613,6 +1644,7 @@ private:
 
         const auto& poolId = ev->Get()->GetPoolId();
         const auto& poolInfo = ResourcePoolsCache.GetPoolInfo(databaseId, poolId, ActorContext());
+
         if (!poolInfo) {
             return true;
         }
@@ -1633,6 +1665,11 @@ private:
         if (!NWorkload::IsWorkloadServiceRequired(poolConfig)) {
             ev->Get()->SetPoolConfig(poolConfig);
         }
+
+#if defined(USE_HDRF_SCHEDULER)
+        Y_ASSERT(!poolId.empty());
+        Send(MakeKqpSchedulerServiceId(SelfId().NodeId()), new NScheduler::TEvAddPool(databaseId, poolId, poolConfig));
+#endif
 
         return true;
     }
@@ -1894,6 +1931,7 @@ private:
     NKikimrConfig::TTableServiceConfig TableServiceConfig;
     NKikimrConfig::TQueryServiceConfig QueryServiceConfig;
     NKikimrConfig::TFeatureFlags FeatureFlags;
+    NKikimrConfig::TWorkloadManagerConfig WorkloadManagerConfig;
     TKqpSettings::TConstPtr KqpSettings;
     IKqpFederatedQuerySetupFactory::TPtr FederatedQuerySetupFactory;
     std::optional<TKqpFederatedQuerySetup> FederatedQuerySetup;
@@ -1910,6 +1948,8 @@ private:
     std::shared_ptr<NComputeActor::IKqpNodeComputeActorFactory> CaFactory_;
     TIntrusivePtr<TKqpShutdownState> ShutdownState;
     TIntrusivePtr<TModuleResolverState> ModuleResolverState;
+
+    TIntrusivePtr<TExecuterMutableConfig> ExecuterConfig;
 
     TIntrusivePtr<TKqpCounters> Counters;
     std::unique_ptr<TLocalSessionsRegistry> LocalSessions;

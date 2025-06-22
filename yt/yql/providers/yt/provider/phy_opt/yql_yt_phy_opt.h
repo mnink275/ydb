@@ -108,6 +108,8 @@ private:
 
     NNodes::TMaybeNode<NNodes::TExprBase> EarlyMergeJoin(NNodes::TExprBase node, TExprContext& ctx) const;
 
+    NNodes::TMaybeNode<NNodes::TExprBase> AddPruneKeys(NNodes::TExprBase node, TExprContext& ctx) const;
+
     NNodes::TMaybeNode<NNodes::TExprBase> RuntimeEquiJoin(NNodes::TExprBase node, TExprContext& ctx) const;
 
     NNodes::TMaybeNode<NNodes::TExprBase> TableContentWithSettings(NNodes::TExprBase node, TExprContext& ctx) const;
@@ -148,6 +150,8 @@ private:
     NNodes::TMaybeNode<NNodes::TExprBase> UpdateDataSinkCluster(NNodes::TExprBase node, TExprContext& ctx) const;
 
     NNodes::TMaybeNode<NNodes::TExprBase> UpdateDataSourceCluster(NNodes::TExprBase node, TExprContext& ctx) const;
+
+    NNodes::TMaybeNode<NNodes::TExprBase> PushPruneKeysIntoYtOperation(NNodes::TExprBase node, TExprContext& ctx) const;
 
     template <typename TLMapType>
     NNodes::TMaybeNode<NNodes::TExprBase> LMap(NNodes::TExprBase node, TExprContext& ctx) const;

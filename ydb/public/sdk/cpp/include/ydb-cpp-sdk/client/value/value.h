@@ -262,10 +262,17 @@ struct TUuidValue {
     } Buf_;
 };
 
+namespace NTable {
+
+class TTableClient;
+
+} // namespace NTable
+
 //! Representation of YDB value.
 class TValue {
     friend class TValueParser;
     friend class TProtoAccessor;
+    friend class ::NYdb::Dev::NTable::TTableClient;
 public:
     TValue(const TType& type, const Ydb::Value& valueProto);
     TValue(const TType& type, Ydb::Value&& valueProto);
@@ -539,3 +546,6 @@ public:
 };
 
 } // namespace NYdb
+
+template<>
+void Out<NYdb::TUuidValue>(IOutputStream& o, const NYdb::TUuidValue& value);

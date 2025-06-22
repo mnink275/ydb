@@ -1,32 +1,42 @@
 #pragma once
 
-#include <yql/essentials/sql/v1/complete/name/name_service.h>
+#include <yql/essentials/sql/v1/complete/core/input.h>
+#include <yql/essentials/sql/v1/complete/core/environment.h>
+#include <yql/essentials/sql/v1/complete/name/service/name_service.h>
 #include <yql/essentials/sql/v1/lexer/lexer.h>
+
+#include <library/cpp/threading/future/future.h>
 
 #include <util/generic/string.h>
 #include <util/generic/vector.h>
+#include <util/generic/hash.h>
+#include <util/generic/hash_set.h>
 
 namespace NSQLComplete {
 
-    struct TCompletionInput {
-        TStringBuf Text;
-        size_t CursorPosition = Text.length();
-    };
-
     struct TCompletedToken {
         TStringBuf Content;
-        size_t SourcePosition;
+        size_t SourcePosition = 0;
     };
 
     enum class ECandidateKind {
         Keyword,
+        PragmaName,
         TypeName,
         FunctionName,
+        HintName,
+        FolderName,
+        TableName,
+        ClusterName,
+        ColumnName,
+        BindingName,
+        UnknownName,
     };
 
     struct TCandidate {
         ECandidateKind Kind;
         TString Content;
+        size_t CursorShift = 0;
 
         friend bool operator==(const TCandidate& lhs, const TCandidate& rhs) = default;
     };
@@ -36,22 +46,40 @@ namespace NSQLComplete {
         TVector<TCandidate> Candidates;
     };
 
+    // TODO(YQL-19747): Make it thread-safe.
     class ISqlCompletionEngine {
     public:
         using TPtr = THolder<ISqlCompletionEngine>;
 
         struct TConfiguration {
+            friend class TSqlCompletionEngine;
+            friend ISqlCompletionEngine::TConfiguration MakeYDBConfiguration();
+            friend ISqlCompletionEngine::TConfiguration MakeYQLConfiguration();
+            friend ISqlCompletionEngine::TConfiguration MakeConfiguration(THashSet<TString> allowedStmts);
+
+        public:
             size_t Limit = 256;
+
+        private:
+            THashSet<TString> IgnoredRules_;
+            THashMap<TString, THashSet<TString>> DisabledPreviousByToken_;
+            THashMap<TString, THashSet<TString>> ForcedPreviousByToken_;
         };
 
-        virtual TCompletion Complete(TCompletionInput input) = 0;
         virtual ~ISqlCompletionEngine() = default;
+
+        virtual TCompletion
+        Complete(TCompletionInput input, TEnvironment env = {}) = 0;
+
+        virtual NThreading::TFuture<TCompletion> // TODO(YQL-19747): Migrate YDB CLI to `Complete` method
+        CompleteAsync(TCompletionInput input, TEnvironment env = {}) = 0;
     };
 
     using TLexerSupplier = std::function<NSQLTranslation::ILexer::TPtr(bool ansi)>;
 
-    // FIXME(YQL-19747): unwanted dependency on a lexer implementation
-    ISqlCompletionEngine::TPtr MakeSqlCompletionEngine();
+    ISqlCompletionEngine::TConfiguration MakeYDBConfiguration();
+
+    ISqlCompletionEngine::TConfiguration MakeYQLConfiguration();
 
     ISqlCompletionEngine::TPtr MakeSqlCompletionEngine(
         TLexerSupplier lexer,

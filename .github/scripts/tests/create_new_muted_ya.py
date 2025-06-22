@@ -12,6 +12,7 @@ from update_mute_issues import (
     create_and_add_issue_to_project,
     generate_github_issue_title_and_body,
     get_muted_tests_from_issues,
+    close_unmuted_issues,
 )
 
 # Configure logging
@@ -28,8 +29,8 @@ DATABASE_ENDPOINT = config["QA_DB"]["DATABASE_ENDPOINT"]
 DATABASE_PATH = config["QA_DB"]["DATABASE_PATH"]
 
 
-def execute_query(driver):
-    query_string = '''
+def execute_query(driver, branch='main', build_type='relwithdebinfo'):
+    query_string = f'''
     SELECT * from (
         SELECT data.*,
         CASE WHEN new_flaky.full_name IS NOT NULL THEN True ELSE False END AS new_flaky_today,
@@ -101,7 +102,7 @@ def execute_query(driver):
             and data.build_type = deleted.build_type
             and data.branch = deleted.branch
         ) 
-        where date_window = CurrentUtcDate() and branch = 'main'
+        where date_window = CurrentUtcDate() and branch = '{branch}' and build_type = '{build_type}'
     
     '''
 
@@ -178,8 +179,8 @@ def apply_and_add_mutes(all_tests, output_path, mute_check):
             for test in all_tests
             if test.get('days_in_state') >= 1
             and test.get('flaky_today')
-            and (test.get('pass_count') + test.get('fail_count')) >= 3
-            and test.get('fail_count') > 2
+            and (test.get('pass_count') + test.get('fail_count')) >= 2
+            and test.get('fail_count') >= 2
             and test.get('fail_count')/(test.get('pass_count') + test.get('fail_count')) > 0.2 # <=80% success rate
         )
         flaky_tests = sorted(flaky_tests)
@@ -191,8 +192,8 @@ def apply_and_add_mutes(all_tests, output_path, mute_check):
             for test in all_tests
             if test.get('days_in_state') >= 1
             and test.get('flaky_today')
-            and (test.get('pass_count') + test.get('fail_count')) >= 3
-            and test.get('fail_count') > 2
+            and (test.get('pass_count') + test.get('fail_count')) >=2
+            and test.get('fail_count') >= 2
             and test.get('fail_count')/(test.get('pass_count') + test.get('fail_count')) > 0.2 # <=80% success rate
         )
         ## тесты может запускаться 1 раз в день. если за последние 7 дней набирается трешход то мьютим
@@ -300,11 +301,22 @@ def read_tests_from_file(file_path):
     return result
 
 
-def create_mute_issues(all_tests, file_path):
+def create_mute_issues(all_tests, file_path, close_issues=True):
     base_date = datetime.datetime(1970, 1, 1)
     tests_from_file = read_tests_from_file(file_path)
     muted_tests_in_issues = get_muted_tests_from_issues()
     prepared_tests_by_suite = {}
+    temp_tests_by_suite = {}
+    
+    # Create set of muted tests for faster lookup
+    muted_tests_set = {test['full_name'] for test in tests_from_file}
+    
+    # Check and close issues if needed
+    closed_issues = []
+    if close_issues:
+        closed_issues = close_unmuted_issues(muted_tests_set)
+    
+    # First, collect all tests into temporary dictionary
     for test in all_tests:
         for test_from_file in tests_from_file:
             if test['full_name'] == test_from_file['full_name']:
@@ -314,9 +326,9 @@ def create_mute_issues(all_tests, file_path):
                     )
                 else:
                     key = f"{test_from_file['testsuite']}:{test['owner']}"
-                    if not prepared_tests_by_suite.get(key):
-                        prepared_tests_by_suite[key] = []
-                    prepared_tests_by_suite[key].append(
+                    if not temp_tests_by_suite.get(key):
+                        temp_tests_by_suite[key] = []
+                    temp_tests_by_suite[key].append(
                         {
                             'mute_string': f"{ test.get('suite_folder')} {test.get('test_name')}",
                             'test_name': test.get('test_name'),
@@ -333,9 +345,20 @@ def create_mute_issues(all_tests, file_path):
                             'branch': test.get('branch'),
                         }
                     )
+    
+    # Split groups larger than 20 tests
+    for key, tests in temp_tests_by_suite.items():
+        if len(tests) <= 40:
+            prepared_tests_by_suite[key] = tests
+        else:
+            # Split into groups of 40
+            for i in range(0, len(tests), 40):
+                chunk = tests[i:i+40]
+                chunk_key = f"{key}_{i//40 + 1}"  # Add iterator to key starting from 1
+                prepared_tests_by_suite[chunk_key] = chunk
+
     results = []
     for item in prepared_tests_by_suite:
-
         title, body = generate_github_issue_title_and_body(prepared_tests_by_suite[item])
         owner_value = prepared_tests_by_suite[item][0]['owner'].split('/', 1)[1] if '/' in prepared_tests_by_suite[item][0]['owner'] else prepared_tests_by_suite[item][0]['owner']
         result = create_and_add_issue_to_project(title, body, state='Muted', owner=owner_value)
@@ -343,11 +366,42 @@ def create_mute_issues(all_tests, file_path):
             break
         else:
             results.append(
-                f"Created issue '{title}' for {prepared_tests_by_suite[item][0]['owner']}, url {result['issue_url']}"
+                {
+                    'message': f"Created issue '{title}' for TEAM:@ydb-platform/{owner_value}, url {result['issue_url']}",
+                    'owner': owner_value
+                }
             )
 
+    # Sort results by owner
+    results.sort(key=lambda x: x['owner'])
+    
+    # Group results by owner and add spacing and headers
+    formatted_results = []
+    
+    # Add closed issues section if any
+    if closed_issues:
+        formatted_results.append("CLOSED ISSUES:")
+        for issue in closed_issues:
+            formatted_results.append(f"Closed {issue['url']}")
+            formatted_results.append("Unmuted tests:")
+            for test in issue['tests']:
+                formatted_results.append(f"  - {test}")
+        formatted_results.append("")
+        formatted_results.append("CREATED ISSUES:")
+    
+    # Add created issues
+    current_owner = None
+    for result in results:
+        if current_owner != result['owner']:
+            if formatted_results and formatted_results[-1] != "":  # Add blank line between owner groups if last line is not empty
+                formatted_results.append('')
+            current_owner = result['owner']
+            # Add owner header with team URL
+            formatted_results.append(f"TEAM:@ydb-platform/{current_owner} @https://github.com/orgs/ydb-platform/teams/{current_owner}")
+        formatted_results.append(result['message'])
+
     print("\n\n")
-    print("\n".join(results))
+    print("\n".join(formatted_results))
     if 'GITHUB_OUTPUT' in os.environ:
         if 'GITHUB_WORKSPACE' not in os.environ:
             raise EnvironmentError("GITHUB_WORKSPACE environment variable is not set.")
@@ -356,9 +410,9 @@ def create_mute_issues(all_tests, file_path):
         print(f"Writing results to {file_path}")
         
         with open(file_path, 'w') as f:
-            f.write("```\n")
-            f.write("\n".join(results))
-            f.write("\n```")
+            f.write("\n")
+            f.write("\n".join(formatted_results))
+            f.write("\n")
             
         with open(os.environ['GITHUB_OUTPUT'], 'a') as gh_out:
             gh_out.write(f"created_issues_file={file_path}")
@@ -389,7 +443,7 @@ def mute_worker(args):
     ) as driver:
         driver.wait(timeout=10, fail_fast=True)
 
-        all_tests = execute_query(driver)
+        all_tests = execute_query(driver, args.branch)
     if args.mode == 'update_muted_ya':
         output_path = args.output_folder
         os.makedirs(output_path, exist_ok=True)
@@ -397,7 +451,7 @@ def mute_worker(args):
 
     elif args.mode == 'create_issues':
         file_path = args.file_path
-        create_mute_issues(all_tests, file_path)
+        create_mute_issues(all_tests, file_path, close_issues=args.close_issues)
 
 
 if __name__ == "__main__":
@@ -407,6 +461,7 @@ if __name__ == "__main__":
 
     update_muted_ya_parser = subparsers.add_parser('update_muted_ya', help='create new muted_ya')
     update_muted_ya_parser.add_argument('--output_folder', default=repo_path, required=False, help='Output folder.')
+    update_muted_ya_parser.add_argument('--branch', default='main', help='Branch to get history')
 
     create_issues_parser = subparsers.add_parser(
         'create_issues',
@@ -415,6 +470,8 @@ if __name__ == "__main__":
     create_issues_parser.add_argument(
         '--file_path', default=f'{repo_path}/mute_update/flaky.txt', required=False, help='file path'
     )
+    create_issues_parser.add_argument('--branch', default='main', help='Branch to get history')
+    create_issues_parser.add_argument('--close_issues', action='store_true', default=True, help='Close issues when all tests are unmuted (default: True)')
 
     args = parser.parse_args()
 

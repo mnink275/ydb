@@ -365,11 +365,15 @@ class TReplicationService: public TActorBootstrapped<TReplicationService> {
     }
 
     template <typename... Args>
-    const TActorId& GetOrCreateYdbProxy(TConnectionParams&& params, Args&&... args) {
-        auto it = YdbProxies.find(params);
+    const TActorId& GetOrCreateYdbProxy(const TString& database, TConnectionParams&& params, Args&&... args) {
+        auto key = params.Endpoint().empty() ? TYdbProxyKey{database} : TYdbProxyKey{params};
+        auto it = YdbProxies.find(key);
         if (it == YdbProxies.end()) {
-            auto ydbProxy = Register(CreateYdbProxy(params.Endpoint(), params.Database(), params.EnableSsl(), std::forward<Args>(args)...));
-            auto res = YdbProxies.emplace(std::move(params), std::move(ydbProxy));
+            auto* actor = params.Endpoint().empty()
+                ? CreateLocalYdbProxy(std::move(database))
+                : CreateYdbProxy(params.Endpoint(), params.Database(), params.EnableSsl(), std::forward<Args>(args)...);
+            auto ydbProxy = Register(actor);
+            auto res = YdbProxies.emplace(std::move(key), std::move(ydbProxy));
             Y_ABORT_UNLESS(res.second);
             it = res.first;
         }
@@ -377,15 +381,15 @@ class TReplicationService: public TActorBootstrapped<TReplicationService> {
         return it->second;
     }
 
-    std::function<IActor*(void)> ReaderFn(const NKikimrReplication::TRemoteTopicReaderSettings& settings) {
+    std::function<IActor*(void)> ReaderFn(const TString& database, const NKikimrReplication::TRemoteTopicReaderSettings& settings, bool autoCommit) {
         TActorId ydbProxy;
         const auto& params = settings.GetConnectionParams();
         switch (params.GetCredentialsCase()) {
         case NKikimrReplication::TConnectionParams::kStaticCredentials:
-            ydbProxy = GetOrCreateYdbProxy(TConnectionParams::FromProto(params), params.GetStaticCredentials());
+            ydbProxy = GetOrCreateYdbProxy(database, TConnectionParams::FromProto(params), params.GetStaticCredentials());
             break;
         case NKikimrReplication::TConnectionParams::kOAuthToken:
-            ydbProxy = GetOrCreateYdbProxy(TConnectionParams::FromProto(params), params.GetOAuthToken().GetToken());
+            ydbProxy = GetOrCreateYdbProxy(database, TConnectionParams::FromProto(params), params.GetOAuthToken().GetToken());
             break;
         default:
             Y_ABORT("Unexpected credentials");
@@ -394,6 +398,7 @@ class TReplicationService: public TActorBootstrapped<TReplicationService> {
         auto topicReaderSettings = TEvYdbProxy::TTopicReaderSettings()
             .MaxMemoryUsageBytes(1_MB)
             .ConsumerName(settings.GetConsumerName())
+            .AutoCommit(autoCommit)
             .AppendTopics(NYdb::NTopic::TTopicReadSettings()
                 .Path(settings.GetTopicPath())
                 .AppendPartitionIds(settings.GetTopicPartitionId())
@@ -431,9 +436,10 @@ class TReplicationService: public TActorBootstrapped<TReplicationService> {
             transformLambda = writerSettings.GetTransformLambda(),
             compilationService = *CompilationService,
             batchingSettings = writerSettings.GetBatching(),
-            transferWriterFactory = transferWriterFactory
+            transferWriterFactory = transferWriterFactory,
+            runAsUser = writerSettings.GetRunAsUser()
         ]() {
-            return transferWriterFactory->Create({transformLambda, tablePathId, compilationService, batchingSettings});
+            return transferWriterFactory->Create({transformLambda, tablePathId, compilationService, batchingSettings, runAsUser});
         };
     }
 
@@ -473,6 +479,7 @@ class TReplicationService: public TActorBootstrapped<TReplicationService> {
         const auto& cmd = record.GetCommand();
         // TODO: validate settings
         const auto& readerSettings = cmd.GetRemoteTopicReader();
+        bool autoCommit = true;
         std::function<IActor*(void)> writerFn;
         if (cmd.HasLocalTableWriter()) {
             const auto& writerSettings = cmd.GetLocalTableWriter();
@@ -485,12 +492,13 @@ class TReplicationService: public TActorBootstrapped<TReplicationService> {
                 LOG_C("Run transfer but TransferWriterFactory does not exists.");
                 return;
             }
+            autoCommit = false;
             writerFn = TransferWriterFn(writerSettings, transferWriterFactory);
         } else {
             Y_ABORT("Unsupported");
         }
         const auto actorId = session.RegisterWorker(this, id,
-            CreateWorker(SelfId(), ReaderFn(readerSettings), std::move(writerFn)));
+            CreateWorker(SelfId(), ReaderFn(cmd.GetDatabase(), readerSettings, autoCommit), std::move(writerFn)));
         WorkerActorIdToSession[actorId] = controller.GetTabletId();
     }
 
@@ -719,7 +727,23 @@ private:
     mutable TMaybe<TString> LogPrefix;
     TActorId BoardPublisher;
     THashMap<ui64, TSessionInfo> Sessions;
-    THashMap<TConnectionParams, TActorId> YdbProxies;
+
+    using TYdbProxyKey = std::variant<TString, TConnectionParams>;
+
+    struct TYdbProxyKeyHash {
+        size_t operator()(const TYdbProxyKey& key) const {
+            switch (key.index()) {
+                case 0:
+                    return THash<TString>()(std::get<TString>(key));
+                case 1:
+                    return THash<TConnectionParams>()(std::get<TConnectionParams>(key));
+                default:
+                    Y_ABORT("unreachable");
+            }
+        }
+    };
+
+    THashMap<TYdbProxyKey, TActorId, TYdbProxyKeyHash> YdbProxies;
     THashMap<TActorId, ui64> WorkerActorIdToSession;
     mutable TMaybe<TActorId> CompilationService;
 

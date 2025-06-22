@@ -43,6 +43,8 @@ void PrepareSensitiveFields(::FederatedQuery::Connection& connection, bool extra
         break;
     case FederatedQuery::ConnectionSetting::kLogging:
         break;
+    case FederatedQuery::ConnectionSetting::kIceberg:
+        break;
     case FederatedQuery::ConnectionSetting::CONNECTION_NOT_SET:
         break;
     }
@@ -205,7 +207,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvCreateConne
         NActors::TActivationContext::ActorSystem(),
         result,
         SelfId(),
-        ev,
+        std::move(ev),
         startTime,
         requestCounters,
         prepare,
@@ -343,7 +345,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvListConnect
         NActors::TActivationContext::ActorSystem(),
         result,
         SelfId(),
-        ev,
+        std::move(ev),
         startTime,
         requestCounters,
         prepare,
@@ -440,7 +442,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvDescribeCon
         NActors::TActivationContext::ActorSystem(),
         result,
         SelfId(),
-        ev,
+        std::move(ev),
         startTime,
         requestCounters,
         prepare,
@@ -501,7 +503,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvModifyConne
     );
 
     std::shared_ptr<std::pair<FederatedQuery::ModifyConnectionResult, TAuditDetails<FederatedQuery::Connection>>> response = std::make_shared<std::pair<FederatedQuery::ModifyConnectionResult, TAuditDetails<FederatedQuery::Connection>>>();
-    auto prepareParams = [=, config=Config, commonCounters=requestCounters.Common](const std::vector<TResultSet>& resultSets) {
+    auto prepareParams = [=, this, config=Config, commonCounters=requestCounters.Common](const std::vector<TResultSet>& resultSets) {
         if (resultSets.size() != 1) {
             ythrow NYql::TCodeLineException(TIssuesIds::INTERNAL_ERROR) << "Result set size is not equal to 1 but equal " << resultSets.size() << ". Please contact internal support";
         }
@@ -636,7 +638,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvModifyConne
         NActors::TActivationContext::ActorSystem(),
         result,
         SelfId(),
-        ev,
+        std::move(ev),
         startTime,
         requestCounters,
         prepare,
@@ -756,7 +758,7 @@ void TYdbControlPlaneStorageActor::Handle(TEvControlPlaneStorage::TEvDeleteConne
         NActors::TActivationContext::ActorSystem(),
         result,
         SelfId(),
-        ev,
+        std::move(ev),
         startTime,
         requestCounters,
         prepare,

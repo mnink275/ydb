@@ -11,15 +11,6 @@
 
 namespace NYdb::inline Dev::NTopic {
 
-class TCommonCodecsProvider {
-public:
-    TCommonCodecsProvider() {
-        TCodecMap::GetTheCodecMap().Set((uint32_t)ECodec::GZIP, std::make_unique<TGzipCodec>());
-        TCodecMap::GetTheCodecMap().Set((uint32_t)ECodec::ZSTD, std::make_unique<TZstdCodec>());
-    }
-};
-TCommonCodecsProvider COMMON_CODECS_PROVIDER;
-
 TDescribeTopicResult::TDescribeTopicResult(TStatus&& status, Ydb::Topic::DescribeTopicResult&& result)
     : TStatus(std::move(status))
     , TopicDescription_(std::move(result))
@@ -414,6 +405,12 @@ const TDuration& TPartitionConsumerStats::GetMaxCommittedTimeLag() const {
 TPartitionLocation::TPartitionLocation(const Ydb::Topic::PartitionLocation& partitionLocation)
     : NodeId_(partitionLocation.node_id())
     , Generation_(partitionLocation.generation())
+{
+}
+
+TPartitionLocation::TPartitionLocation(std::int32_t nodeId, std::int64_t generation)
+    : NodeId_(nodeId)
+    , Generation_(generation)
 {
 }
 
